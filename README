@@ -481,13 +481,18 @@ The memory converter does not advertise scaling, rotation or VA video
 processing. Those operations remain with a suitable renderer or another
 converter.
 
-Four conversion queue slots are reused. Presentation backing is allocated
-on demand and kept stable for each surface. Driver-owned standalone backing
-is limited to 512 MiB per VA display; exhausted allocation reports an error.
-The kernel converter separately limits queues to eight buffers and 256 MiB
-of live mapped/allocated queue storage. Neither limit includes decoder
-reference storage or DMA-BUF references retained solely by a client after
-export. STREAMOFF and context destruction drain hardware access before
+Up to four conversions are in flight. Importing a DMA-BUF maps it into the
+converter's IOMMU, so every decoder buffer keeps its own source index and
+every destination buffer a stable target index (up to 32, least recently
+used reused); the kernel then keeps the mapping instead of rebuilding it
+per frame. Destination attachments live until the decode context ends.
+Presentation backing is allocated on demand and kept stable for each
+surface. Driver-owned standalone backing is limited to 512 MiB per VA
+display; exhausted allocation reports an error. The kernel converter limits
+its own allocations to eight buffers and 256 MiB per device and accepts up
+to 64 imported buffers per queue, which it does not count. Neither limit
+includes decoder reference storage or DMA-BUF references retained solely by
+a client after export. STREAMOFF and context destruction drain hardware access before
 buffers can be reused. CPU image access brackets DMA-BUF synchronization.
 
 P010 preserves precision; it is not HDR tone mapping. Players must preserve

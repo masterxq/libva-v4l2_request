@@ -27,6 +27,7 @@
 #define V4L2_REQUEST_H
 
 #include <stdatomic.h>
+#include <sys/types.h>
 #include <linux/videodev2.h>
 #include <pthread.h>
 #include <stdbool.h>
@@ -70,7 +71,8 @@ static inline uint64_t v4l2r_now_ns(void)
 #define V4L2R_POLL_TIMEOUT_MS		2000
 
 /* In-flight job slots on the format converter, per decode context. */
-#define V4L2R_CONVERT_SLOTS		4
+#define V4L2R_CONVERT_SLOTS		4	/* conversions in flight */
+#define V4L2R_CONVERT_TARGETS		32	/* destination buffers kept attached */
 
 #define V4L2R_ID_OFFSET_CONFIG		0x01000000
 #define V4L2R_ID_OFFSET_CONTEXT		0x02000000
@@ -334,16 +336,30 @@ struct v4l2r_context {
  * dma-buf out) as soon as their decode finishes. All fields are protected
  * by ctx->mutex.
  */
+/*
+ * The converter imports decoder and surface buffers as DMA-BUFs. Importing
+ * maps them into the converter's IOMMU, which costs milliseconds per buffer,
+ * but V4L2 keeps the mapping while the same DMA-BUF returns to the same
+ * buffer index. Sources therefore use the decoder's CAPTURE index, and each
+ * destination DMA-BUF keeps a stable index (least recently used one reused).
+ */
 struct v4l2r_convert {
 	int fd;
 	struct v4l2_format output_format;	/* source = decoder CAPTURE format */
-	struct v4l2_format capture_format;	/* destination, NV12 */
-	uint32_t busy;				/* bitmask of in-flight slots */
-	unsigned int next_slot;
+	struct v4l2_format capture_format;	/* destination, NV12 or P010 */
+	unsigned int nb_sources;		/* OUTPUT buffer indices */
+	unsigned int nb_targets;		/* CAPTURE buffer indices */
+	unsigned int in_flight;
+	uint64_t busy_sources;			/* OUTPUT indices queued */
+	uint64_t busy;				/* CAPTURE indices queued */
+	uint64_t clock;				/* use counter for target reuse */
 	struct {
+		ino_t dmabuf;			/* destination DMA-BUF identity */
+		uint64_t used;
+		int source;			/* OUTPUT index of the job */
 		int capture_index;		/* decoder CAPTURE buffer read */
 		struct v4l2r_surface *surface;	/* destination surface */
-	} jobs[V4L2R_CONVERT_SLOTS];
+	} jobs[V4L2R_CONVERT_TARGETS];
 	bool failed;			/* chain broke (layout/queue error), disabled */
 };
 

@@ -29,6 +29,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <linux/videodev2.h>
@@ -149,23 +150,27 @@ VAStatus v4l2r_convert_setup(struct v4l2r_context *ctx, struct v4l2r_surface *su
 	if (source_planes > 1 && ioctl(conv->fd, VIDIOC_S_SELECTION, &selection) < 0)
 		goto fail;
 
+	/* Imported buffers allocate nothing; ask for one index per decoder
+	 * buffer and a stable set of destinations, accept what the device
+	 * grants (older converters allow fewer and then re-import). */
 	reqbufs = (struct v4l2_requestbuffers) {
-		.count = V4L2R_CONVERT_SLOTS,
+		.count = V4L2R_MAX_CAPTURE_BUFFERS,
 		.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE,
 		.memory = V4L2_MEMORY_DMABUF,
 	};
-	if (ioctl(conv->fd, VIDIOC_REQBUFS, &reqbufs) < 0 ||
-	    reqbufs.count < V4L2R_CONVERT_SLOTS)
+	if (ioctl(conv->fd, VIDIOC_REQBUFS, &reqbufs) < 0 || !reqbufs.count)
 		goto fail;
+	conv->nb_sources = reqbufs.count < 64 ? reqbufs.count : 64;
 
 	reqbufs = (struct v4l2_requestbuffers) {
-		.count = V4L2R_CONVERT_SLOTS,
+		.count = V4L2R_CONVERT_TARGETS,
 		.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
 		.memory = V4L2_MEMORY_DMABUF,
 	};
-	if (ioctl(conv->fd, VIDIOC_REQBUFS, &reqbufs) < 0 ||
-	    reqbufs.count < V4L2R_CONVERT_SLOTS)
+	if (ioctl(conv->fd, VIDIOC_REQBUFS, &reqbufs) < 0 || !reqbufs.count)
 		goto fail;
+	conv->nb_targets = reqbufs.count < V4L2R_CONVERT_TARGETS ?
+			   reqbufs.count : V4L2R_CONVERT_TARGETS;
 
 	type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
 	if (ioctl(conv->fd, VIDIOC_STREAMON, &type) < 0)
@@ -174,8 +179,10 @@ VAStatus v4l2r_convert_setup(struct v4l2r_context *ctx, struct v4l2r_surface *su
 	if (ioctl(conv->fd, VIDIOC_STREAMON, &type) < 0)
 		goto fail;
 
-	for (unsigned int i = 0; i < V4L2R_CONVERT_SLOTS; i++)
+	for (unsigned int i = 0; i < V4L2R_CONVERT_TARGETS; i++) {
 		conv->jobs[i].capture_index = -1;
+		conv->jobs[i].source = -1;
+	}
 
 	ctx->conv = conv;
 
@@ -200,8 +207,8 @@ void v4l2r_convert_destroy(struct v4l2r_context *ctx)
 		return;
 
 	/* Abandon in-flight jobs: their frames are never read again. */
-	for (unsigned int i = 0; i < V4L2R_CONVERT_SLOTS; i++) {
-		if ((conv->busy & (1u << i)) && conv->jobs[i].surface)
+	for (unsigned int i = 0; i < conv->nb_targets; i++) {
+		if ((conv->busy & (UINT64_C(1) << i)) && conv->jobs[i].surface)
 			conv->jobs[i].surface->convert_pending = false;
 	}
 
@@ -222,13 +229,16 @@ static void convert_fail(struct v4l2r_context *ctx)
 	ioctl(conv->fd, VIDIOC_STREAMOFF, &type);
 	type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
 	ioctl(conv->fd, VIDIOC_STREAMOFF, &type);
-	for (unsigned int i = 0; i < V4L2R_CONVERT_SLOTS; i++) {
-		if ((conv->busy & (1u << i)) && conv->jobs[i].surface)
+	for (unsigned int i = 0; i < conv->nb_targets; i++) {
+		if ((conv->busy & (UINT64_C(1) << i)) && conv->jobs[i].surface)
 			conv->jobs[i].surface->convert_pending = false;
 		conv->jobs[i].surface = NULL;
 		conv->jobs[i].capture_index = -1;
+		conv->jobs[i].source = -1;
 	}
 	conv->busy = 0;
+	conv->busy_sources = 0;
+	conv->in_flight = 0;
 }
 
 /*
@@ -270,23 +280,21 @@ static int convert_reap(struct v4l2r_context *ctx, bool wait)
 			continue;
 		}
 
-		if ((buffer.flags & V4L2_BUF_FLAG_ERROR) || buffer.index >= V4L2R_CONVERT_SLOTS ||
-		    !(conv->busy & (1u << buffer.index))) {
+		if ((buffer.flags & V4L2_BUF_FLAG_ERROR) || buffer.index >= conv->nb_targets ||
+		    !(conv->busy & (UINT64_C(1) << buffer.index))) {
 			convert_fail(ctx);
 			return -EIO;
 		}
 
-		if (buffer.index < V4L2R_CONVERT_SLOTS &&
-		    (conv->busy & (1u << buffer.index))) {
-			unsigned int slot = buffer.index;
+		unsigned int target = buffer.index;
 
-			if (conv->jobs[slot].surface)
-				conv->jobs[slot].surface->convert_pending = false;
-			conv->jobs[slot].surface = NULL;
-			conv->jobs[slot].capture_index = -1;
-			conv->busy &= ~(1u << slot);
-			reaped++;
-		}
+		if (conv->jobs[target].surface)
+			conv->jobs[target].surface->convert_pending = false;
+		conv->jobs[target].surface = NULL;
+		conv->jobs[target].capture_index = -1;
+		conv->busy &= ~(UINT64_C(1) << target);
+		conv->in_flight--;
+		reaped++;
 
 		/* The paired source buffer completes with the job. */
 		memset(planes, 0, sizeof(planes));
@@ -296,14 +304,15 @@ static int convert_reap(struct v4l2r_context *ctx, bool wait)
 			.length = conv->output_format.fmt.pix_mp.num_planes,
 			.m.planes = planes,
 		};
-		if (ioctl(conv->fd, VIDIOC_DQBUF, &buffer) < 0) {
-			/* The slot's source stays queued, so reusing the slot
+		if (ioctl(conv->fd, VIDIOC_DQBUF, &buffer) < 0 || buffer.index >= conv->nb_sources) {
+			/* The job's source stays queued, so reusing its index
 			 * would fail anyway; disable the chain explicitly. */
 			v4l2r_log("failed to dequeue converter source: %s\n",
 				  strerror(errno));
 			convert_fail(ctx);
 			return -EIO;
 		}
+		conv->busy_sources &= ~(UINT64_C(1) << buffer.index);
 	}
 
 	return reaped;
@@ -316,7 +325,8 @@ void v4l2r_convert_kick(struct v4l2r_context *ctx, int capture_index)
 	struct v4l2r_surface *surface;
 	struct v4l2_plane planes[VIDEO_MAX_PLANES];
 	struct v4l2_buffer buffer;
-	unsigned int slot;
+	struct stat identity;
+	unsigned int source, target;
 
 	if (!conv || conv->failed)
 		return;
@@ -331,22 +341,50 @@ void v4l2r_convert_kick(struct v4l2r_context *ctx, int capture_index)
 	if (convert_reap(ctx, false) < 0 || conv->failed)
 		return;
 
-	/* All slots busy: wait one out. */
-	while (conv->busy & (1u << conv->next_slot)) {
-		if (convert_reap(ctx, true) < 0) {
-			v4l2r_log("format converter stalled\n");
-			return;
-		}
-	}
-	slot = conv->next_slot;
-	conv->next_slot = (slot + 1) % V4L2R_CONVERT_SLOTS;
-
 	if (v4l2r_surface_convert_backing(ctx->drv, surface) !=
 	    VA_STATUS_SUCCESS) {
 		if (!conv->failed)
 			v4l2r_log("no conversion backing for surface, output will be wrong\n");
 		convert_fail(ctx);
 		return;
+	}
+	if (fstat(surface->backing->dmabuf_fd[0], &identity) < 0) {
+		convert_fail(ctx);
+		return;
+	}
+
+	/* Same DMA-BUF, same index: the kernel keeps its mapping. */
+	source = (unsigned int)capture_index % conv->nb_sources;
+	for (;;) {
+		unsigned int free_target = conv->nb_targets;
+		bool waiting = false;
+
+		target = conv->nb_targets;
+		for (unsigned int i = 0; i < conv->nb_targets; i++) {
+			bool busy = conv->busy & (UINT64_C(1) << i);
+
+			if (conv->jobs[i].dmabuf == identity.st_ino) {
+				target = i;
+				waiting = busy;
+				break;
+			}
+			if (!busy && (free_target == conv->nb_targets ||
+				      conv->jobs[i].used < conv->jobs[free_target].used))
+				free_target = i;
+		}
+		if (target == conv->nb_targets)
+			target = free_target;
+		if (target == conv->nb_targets)
+			waiting = true;
+		if (conv->busy_sources & (UINT64_C(1) << source) ||
+		    conv->in_flight >= V4L2R_CONVERT_SLOTS)
+			waiting = true;
+		if (!waiting)
+			break;
+		if (convert_reap(ctx, true) < 0) {
+			v4l2r_log("format converter stalled\n");
+			return;
+		}
 	}
 
 	if (v4l2r_export_capture_dmabufs(ctx, capture, capture_index) < 0) {
@@ -364,7 +402,7 @@ void v4l2r_convert_kick(struct v4l2r_context *ctx, int capture_index)
 		planes[p].bytesused = conv->output_format.fmt.pix_mp.plane_fmt[p].sizeimage;
 	}
 	buffer = (struct v4l2_buffer) {
-		.index = slot,
+		.index = source,
 		.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE,
 		.memory = V4L2_MEMORY_DMABUF,
 		.length = capture->nb_planes,
@@ -376,12 +414,13 @@ void v4l2r_convert_kick(struct v4l2r_context *ctx, int capture_index)
 		convert_fail(ctx);
 		return;
 	}
+	conv->busy_sources |= UINT64_C(1) << source;
 
 	memset(planes, 0, sizeof(planes));
 	planes[0].m.fd = surface->backing->dmabuf_fd[0];
 	planes[0].length = surface->backing->plane_size[0];
 	buffer = (struct v4l2_buffer) {
-		.index = slot,
+		.index = target,
 		.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
 		.memory = V4L2_MEMORY_DMABUF,
 		.length = 1,
@@ -394,9 +433,13 @@ void v4l2r_convert_kick(struct v4l2r_context *ctx, int capture_index)
 		return;
 	}
 
-	conv->jobs[slot].capture_index = capture_index;
-	conv->jobs[slot].surface = surface;
-	conv->busy |= 1u << slot;
+	conv->jobs[target].dmabuf = identity.st_ino;
+	conv->jobs[target].used = ++conv->clock;
+	conv->jobs[target].source = source;
+	conv->jobs[target].capture_index = capture_index;
+	conv->jobs[target].surface = surface;
+	conv->busy |= UINT64_C(1) << target;
+	conv->in_flight++;
 	surface->convert_pending = true;
 }
 
@@ -411,8 +454,8 @@ void v4l2r_convert_drain_index(struct v4l2r_context *ctx, int capture_index)
 	pthread_mutex_lock(&ctx->mutex);
 	while (in_flight) {
 		in_flight = false;
-		for (unsigned int i = 0; i < V4L2R_CONVERT_SLOTS; i++) {
-			if ((conv->busy & (1u << i)) &&
+		for (unsigned int i = 0; i < conv->nb_targets; i++) {
+			if ((conv->busy & (UINT64_C(1) << i)) &&
 			    conv->jobs[i].capture_index == capture_index) {
 				in_flight = true;
 				break;
