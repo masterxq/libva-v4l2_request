@@ -305,7 +305,32 @@ static bool video_device_probe_hevc_10bit(int fd, uint32_t output_type)
 		sps.pic_height_in_luma_samples = format.fmt.pix.height;
 	}
 
-	return ioctl(fd, VIDIOC_S_EXT_CTRLS, &controls) == 0;
+	if (ioctl(fd, VIDIOC_S_EXT_CTRLS, &controls) < 0)
+		return false;
+
+	/*
+	 * The hardware decoding 10 bit is not enough: one of the CAPTURE
+	 * formats offered for the 10-bit stream must be one we can hand out
+	 * (or convert). Otherwise clients would pick VA-API for 10-bit
+	 * streams and fail every frame instead of decoding in software.
+	 */
+	{
+		struct v4l2_fmtdesc fmtdesc = {
+			.type = mplane ? V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE :
+					 V4L2_BUF_TYPE_VIDEO_CAPTURE,
+		};
+
+		while (ioctl(fd, VIDIOC_ENUM_FMT, &fmtdesc) >= 0) {
+			const struct v4l2r_format_info *info =
+				v4l2r_format_by_pixelformat(fmtdesc.pixelformat);
+
+			if (info && info->bit_depth == 10)
+				return true;
+			fmtdesc.index++;
+		}
+	}
+
+	return false;
 #else
 	(void)fd;
 	(void)output_type;
@@ -625,7 +650,11 @@ static bool driver_supports_profile(struct v4l2r_driver *drv, VAProfile profile)
 	if (!codec || !driver_supports_pixelformat(drv, codec->pixelformat))
 		return false;
 
-	if (profile == VAProfileHEVCMain10 && !driver_supports_hevc_10bit(drv))
+	/* hevc_10bit also means a usable 10-bit CAPTURE format exists; the
+	 * same holds for VP9 profile 2 on the decoders seen so far. */
+	if ((profile == VAProfileHEVCMain10 ||
+	     profile == VAProfileVP9Profile2) &&
+	    !driver_supports_hevc_10bit(drv))
 		return false;
 
 	return true;
