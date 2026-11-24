@@ -450,6 +450,7 @@ static VAStatus backing_alloc_default(struct v4l2r_driver *drv,
 				      struct v4l2r_surface *surface)
 {
 	uint32_t pixelformat = V4L2_PIX_FMT_NV12;
+	VAStatus status;
 
 	/* With a converter around, 10-bit configs hand out NV12 surfaces;
 	 * bare P010 only works on decoders that produce it natively. */
@@ -459,8 +460,19 @@ static VAStatus backing_alloc_default(struct v4l2r_driver *drv,
 	     !v4l2r_converter_available(drv)))
 		pixelformat = V4L2_PIX_FMT_P010;
 
-	return backing_alloc(drv, surface, surface->width, surface->height,
-			     pixelformat);
+	status = backing_alloc(drv, surface, surface->width, surface->height,
+			       pixelformat);
+
+#if defined(V4L2_PIX_FMT_MM21)
+	/* Decoders that only write MediaTek block tiles (mtk-vcodec-dec):
+	 * hand out the tiled layout, as decoded surfaces have it too, so
+	 * importers probing bare surfaces see what they will get later. */
+	if (status != VA_STATUS_SUCCESS && pixelformat == V4L2_PIX_FMT_NV12)
+		status = backing_alloc(drv, surface, surface->width,
+				       surface->height, V4L2_PIX_FMT_MM21);
+#endif
+
+	return status;
 }
 
 /*
@@ -723,11 +735,16 @@ static VAStatus fill_prime_descriptor(const struct v4l2r_frame_view *view,
 	}
 #endif
 
+	/* Per-plane layers for linear NV12/P010 and for the MediaTek block
+	 * tiles, whose R8 and GR88 planes importers handle separately too. */
 	if ((flags & VA_EXPORT_SURFACE_SEPARATE_LAYERS) && two_planes &&
-	    view->nb_planes == 1 &&
 	    (info->drm_format == DRM_FORMAT_NV12 ||
 	     info->drm_format == DRM_FORMAT_P010) &&
-	    modifier == DRM_FORMAT_MOD_LINEAR) {
+	    ((modifier == DRM_FORMAT_MOD_LINEAR && view->nb_planes == 1)
+#if defined(DRM_FORMAT_MOD_MTK_16L_32S_TILE)
+	     || modifier == DRM_FORMAT_MOD_MTK_16L_32S_TILE
+#endif
+	     )) {
 		bool p010 = info->drm_format == DRM_FORMAT_P010;
 
 		desc->num_layers = 2;
@@ -738,8 +755,8 @@ static VAStatus fill_prime_descriptor(const struct v4l2r_frame_view *view,
 		desc->layers[0].pitch[0] = pitch;
 		desc->layers[1].drm_format = p010 ? DRM_FORMAT_GR1616 : DRM_FORMAT_GR88;
 		desc->layers[1].num_planes = 1;
-		desc->layers[1].object_index[0] = 0;
-		desc->layers[1].offset[0] = offset1;
+		desc->layers[1].object_index[0] = view->nb_planes > 1 ? 1 : 0;
+		desc->layers[1].offset[0] = view->nb_planes > 1 ? 0 : offset1;
 		desc->layers[1].pitch[0] = pitch1;
 
 		return VA_STATUS_SUCCESS;

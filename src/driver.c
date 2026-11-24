@@ -142,6 +142,12 @@ static const struct v4l2r_format_info format_infos[] = {
 	{ V4L2_PIX_FMT_NV12_32L32, DRM_FORMAT_NV12, DRM_FORMAT_MOD_ALLWINNER_TILED,
 	  0, VA_RT_FORMAT_YUV420, 8, false },
 #endif
+#if defined(V4L2_PIX_FMT_MM21) && defined(DRM_FORMAT_MOD_MTK_16L_32S_TILE)
+	/* MediaTek 16x32 luma / 16x16 chroma block tiles (mtk-vcodec-dec).
+	 * Not mappable as a linear VAImage; GetImage detiles on the CPU. */
+	{ V4L2_PIX_FMT_MM21, DRM_FORMAT_NV12, DRM_FORMAT_MOD_MTK_16L_32S_TILE,
+	  VA_FOURCC_NV12, VA_RT_FORMAT_YUV420, 8, false },
+#endif
 #if defined(V4L2_PIX_FMT_NV15) && defined(DRM_FORMAT_NV15)
 	{ V4L2_PIX_FMT_NV15, DRM_FORMAT_NV15, DRM_FORMAT_MOD_LINEAR,
 	  0, VA_RT_FORMAT_YUV420_10, 10, false },

@@ -98,6 +98,20 @@ static uint32_t capture_surface_id(struct v4l2r_context *ctx, uint32_t index)
 	return VA_INVALID_ID;
 }
 
+/* Memory planes of a multiplanar buffer: the CAPTURE format may have
+ * several (MM21: luma and chroma), the bitstream always has one. */
+static unsigned int buffer_num_planes(struct v4l2r_context *ctx,
+				      enum v4l2_buf_type type)
+{
+	unsigned int n = 1;
+
+	if (!V4L2_TYPE_IS_OUTPUT(type) &&
+	    V4L2_TYPE_IS_MULTIPLANAR(ctx->capture_format.type))
+		n = ctx->capture_format.fmt.pix_mp.num_planes;
+
+	return n ? n : 1;
+}
+
 static int queue_buffer(struct v4l2r_context *ctx, struct v4l2_buffer *buffer)
 {
 	struct v4l2_plane planes[VIDEO_MAX_PLANES] = {0};
@@ -105,7 +119,7 @@ static int queue_buffer(struct v4l2r_context *ctx, struct v4l2_buffer *buffer)
 	if (V4L2_TYPE_IS_MULTIPLANAR(buffer->type)) {
 		planes[0].bytesused = buffer->bytesused;
 		buffer->bytesused = 0;
-		buffer->length = 1;
+		buffer->length = buffer_num_planes(ctx, buffer->type);
 		buffer->m.planes = planes;
 	}
 
@@ -171,7 +185,7 @@ static int dequeue_buffer(struct v4l2r_context *ctx, enum v4l2_buf_type type)
 	};
 
 	if (V4L2_TYPE_IS_MULTIPLANAR(type)) {
-		buffer.length = 1;
+		buffer.length = buffer_num_planes(ctx, type);
 		buffer.m.planes = planes;
 	}
 
@@ -223,7 +237,9 @@ static int wait_on_capture_locked(struct v4l2r_context *ctx, uint32_t index)
 
 	while (ctx->queued_capture & (UINT64_C(1) << index)) {
 		int ret = poll(&pollfd, 1, V4L2R_POLL_TIMEOUT_MS);
-		if (ret <= 0)
+		/* POLLERR: the queue holds nothing to wait for (or is in
+		 * error), DQBUF would keep returning EAGAIN. */
+		if (ret <= 0 || (pollfd.revents & POLLERR))
 			return -EIO;
 
 		ret = dequeue_buffer(ctx, ctx->capture_format.type);
@@ -276,7 +292,9 @@ static int wait_completed_locked(struct v4l2r_context *ctx, uint64_t target)
 	 * submitted up to the target sequence. */
 	while (ctx->completed < target && ctx->queued_capture) {
 		int ret = poll(&pollfd, 1, V4L2R_POLL_TIMEOUT_MS);
-		if (ret <= 0)
+		/* POLLERR: the queue holds nothing to wait for (or is in
+		 * error), DQBUF would keep returning EAGAIN. */
+		if (ret <= 0 || (pollfd.revents & POLLERR))
 			return -EIO;
 
 		ret = dequeue_buffer(ctx, ctx->capture_format.type);
@@ -332,7 +350,7 @@ static struct v4l2r_output_buffer *next_output(struct v4l2r_context *ctx)
 
 	while (ctx->queued_output & (1u << output->index)) {
 		int ret = poll(&pollfd, 1, V4L2R_POLL_TIMEOUT_MS);
-		if (ret <= 0)
+		if (ret <= 0 || (pollfd.revents & POLLERR))
 			goto fail;
 
 		ret = dequeue_buffer(ctx, ctx->output_format.type);

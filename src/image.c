@@ -237,6 +237,71 @@ VAStatus v4l2r_SetImagePalette(VADriverContextP va_ctx, VAImageID image,
 	return VA_STATUS_ERROR_UNIMPLEMENTED;
 }
 
+#if defined(V4L2_PIX_FMT_MM21)
+/*
+ * MM21: the luma plane is made of 16x32 byte tiles, the interleaved CbCr
+ * plane of 16x16 byte tiles; each tile is stored linearly and the tiles
+ * follow each other in raster order, one tile row spanning the plane pitch.
+ */
+static void detile_mm21_plane(uint8_t *dst, unsigned int dst_pitch,
+			      const uint8_t *src, unsigned int src_pitch,
+			      unsigned int width, unsigned int height,
+			      unsigned int tile_h)
+{
+	const unsigned int tile_size = 16 * tile_h;
+	const unsigned int tiles_x = src_pitch / 16;
+
+	for (unsigned int y = 0; y < height; y += tile_h) {
+		const uint8_t *row = src + (size_t)(y / tile_h) * tiles_x * tile_size;
+		unsigned int lines = height - y < tile_h ? height - y : tile_h;
+
+		for (unsigned int tx = 0; tx * 16 < width; tx++) {
+			const uint8_t *tile = row + (size_t)tx * tile_size;
+			uint8_t *out = dst + (size_t)y * dst_pitch + tx * 16;
+			unsigned int n = width - tx * 16 < 16 ? width - tx * 16 : 16;
+
+			if (n == 16) {
+				for (unsigned int l = 0; l < lines; l++)
+					memcpy(out + (size_t)l * dst_pitch,
+					       tile + l * 16, 16);
+			} else {
+				for (unsigned int l = 0; l < lines; l++)
+					memcpy(out + (size_t)l * dst_pitch,
+					       tile + l * 16, n);
+			}
+		}
+	}
+}
+
+static VAStatus get_image_mm21(const struct v4l2r_frame_view *view,
+			       VAImage *image, struct v4l2r_buffer *buffer,
+			       unsigned int width, unsigned int height)
+{
+	const uint8_t *src_chroma;
+
+	if (image->format.fourcc != VA_FOURCC_NV12 || view->pitch % 16)
+		return VA_STATUS_ERROR_OPERATION_FAILED;
+
+	if (width > view->width || height > view->height ||
+	    width > image->width || height > image->height ||
+	    width > image->pitches[0] || width > image->pitches[1])
+		return VA_STATUS_ERROR_OPERATION_FAILED;
+
+	if (view->nb_planes > 1)
+		src_chroma = view->map[1];
+	else
+		src_chroma = (const uint8_t *)view->map[0] +
+			     (size_t)view->pitch * view->height;
+
+	detile_mm21_plane(buffer->data + image->offsets[0], image->pitches[0],
+			  view->map[0], view->pitch, width, height, 32);
+	detile_mm21_plane(buffer->data + image->offsets[1], image->pitches[1],
+			  src_chroma, view->pitch, width, (height + 1) / 2, 16);
+
+	return VA_STATUS_SUCCESS;
+}
+#endif
+
 VAStatus v4l2r_GetImage(VADriverContextP va_ctx, VASurfaceID surface_id,
 			int x, int y, unsigned int width, unsigned int height,
 			VAImageID image_id)
@@ -272,6 +337,15 @@ VAStatus v4l2r_GetImage(VADriverContextP va_ctx, VASurfaceID surface_id,
 	status = v4l2r_surface_view(drv, surface, true, &view);
 	if (status != VA_STATUS_SUCCESS)
 		return status;
+
+#if defined(V4L2_PIX_FMT_MM21)
+	if (view.pixelformat == V4L2_PIX_FMT_MM21) {
+		buffer = V4L2R_BUFFER_GET(drv, image->buf);
+		if (!buffer)
+			return VA_STATUS_ERROR_INVALID_BUFFER;
+		return get_image_mm21(&view, image, buffer, width, height);
+	}
+#endif
 
 	if (!view.info->linear || !view.info->va_fourcc)
 		return VA_STATUS_ERROR_OPERATION_FAILED;
