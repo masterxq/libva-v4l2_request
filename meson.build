@@ -36,6 +36,20 @@ conf.set10('HAVE_HEVC_DECODE_PARAMS_NUM_DELTA_POCS',
                          'num_delta_pocs_of_ref_rps_idx',
                          prefix: '#include <linux/videodev2.h>'))
 
+# MediaTek MM21 block tiles (mtk-vcodec-dec) need the pixel format in the
+# kernel uapi and the tile modifier in libdrm; without both the driver is
+# built without MM21 support. -Dmm21=enabled turns that into an error.
+have_mm21 = cc.compiles('''#include <linux/videodev2.h>
+#include <drm_fourcc.h>
+#if !defined(V4L2_PIX_FMT_MM21) || !defined(DRM_FORMAT_MOD_MTK_16L_32S_TILE)
+#error no MM21
+#endif''',
+                        dependencies: libdrm_dep,
+                        name: 'MediaTek MM21 support')
+if get_option('mm21').enabled() and not have_mm21
+  error('MM21 requested, but linux/videodev2.h lacks V4L2_PIX_FMT_MM21 or drm_fourcc.h lacks DRM_FORMAT_MOD_MTK_16L_32S_TILE')
+endif
+
 configure_file(output: 'config.h', configuration: conf)
 root_inc = include_directories('.')
 

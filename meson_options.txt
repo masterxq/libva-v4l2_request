@@ -1,2 +1,4 @@
 option('driverdir', type: 'string', value: '',
        description: 'libva driver installation directory (defaults to the libva pkg-config driverdir)')
+option('mm21', type: 'feature', value: 'auto',
+       description: 'MediaTek MM21 block-tiled decoder output (needs V4L2_PIX_FMT_MM21 and DRM_FORMAT_MOD_MTK_16L_32S_TILE)')
