@@ -148,6 +148,11 @@ static const struct v4l2r_format_info format_infos[] = {
 	{ V4L2_PIX_FMT_MM21, DRM_FORMAT_NV12, DRM_FORMAT_MOD_MTK_16L_32S_TILE,
 	  VA_FOURCC_NV12, VA_RT_FORMAT_YUV420, 8, false },
 #endif
+#if defined(V4L2_PIX_FMT_MT2110T) && defined(V4L2_PIX_FMT_MT2110R)
+	/* Decoder reference layouts require a lossless linear converter. */
+	{ V4L2_PIX_FMT_MT2110T, 0, 0, 0, VA_RT_FORMAT_YUV420_10, 10, false },
+	{ V4L2_PIX_FMT_MT2110R, 0, 0, 0, VA_RT_FORMAT_YUV420_10, 10, false },
+#endif
 #if defined(V4L2_PIX_FMT_NV15) && defined(DRM_FORMAT_NV15)
 	{ V4L2_PIX_FMT_NV15, DRM_FORMAT_NV15, DRM_FORMAT_MOD_LINEAR,
 	  0, VA_RT_FORMAT_YUV420_10, 10, false },
@@ -257,7 +262,7 @@ static int devnode_from_devnum(uint32_t major, uint32_t minor, char *path,
  * size exceeds the current OUTPUT format — so the SPS is sized to the dimensions
  * the device just accepted for the coded format.
  */
-static bool video_device_probe_hevc_10bit(int fd, uint32_t output_type)
+static bool video_device_probe_hevc_10bit(int fd, uint32_t output_type, bool *tiled)
 {
 #if HAVE_V4L2_CTRL_HEVC
 	bool mplane = V4L2_TYPE_IS_MULTIPLANAR(output_type);
@@ -324,8 +329,13 @@ static bool video_device_probe_hevc_10bit(int fd, uint32_t output_type)
 			const struct v4l2r_format_info *info =
 				v4l2r_format_by_pixelformat(fmtdesc.pixelformat);
 
-			if (info && info->bit_depth == 10)
+			if (info && info->bit_depth == 10) {
+#if defined(V4L2_PIX_FMT_MT2110T) && defined(V4L2_PIX_FMT_MT2110R)
+				*tiled = fmtdesc.pixelformat == V4L2_PIX_FMT_MT2110T ||
+					 fmtdesc.pixelformat == V4L2_PIX_FMT_MT2110R;
+#endif
 				return true;
+			}
 			fmtdesc.index++;
 		}
 	}
@@ -348,7 +358,7 @@ static bool video_device_is_request_decoder(const char *path,
 	uint32_t output_type;
 	int fd;
 
-	fd = open(path, O_RDWR | O_NONBLOCK);
+	fd = open(path, O_RDWR | O_NONBLOCK | O_CLOEXEC);
 	if (fd < 0)
 		return false;
 
@@ -389,10 +399,11 @@ static bool video_device_is_request_decoder(const char *path,
 	}
 
 	decoder->hevc_10bit = false;
+	decoder->tiled_10bit = false;
 	for (unsigned int i = 0; i < decoder->nb_pixelformats; i++) {
 		if (decoder->pixelformats[i] == V4L2_PIX_FMT_HEVC_SLICE) {
 			decoder->hevc_10bit =
-				video_device_probe_hevc_10bit(fd, output_type);
+				video_device_probe_hevc_10bit(fd, output_type, &decoder->tiled_10bit);
 			break;
 		}
 	}
@@ -495,7 +506,9 @@ static bool video_device_is_converter(const char *path,
 	bool src_convertible = false;
 	int fd;
 
-	fd = open(path, O_RDWR | O_NONBLOCK);
+	memset(conv, 0, sizeof(*conv));
+
+	fd = open(path, O_RDWR | O_NONBLOCK | O_CLOEXEC);
 	if (fd < 0)
 		return false;
 
@@ -523,7 +536,7 @@ static bool video_device_is_converter(const char *path,
 			fmtdesc.pixelformat;
 
 		/* Only useful if it reads a format we cannot hand out. */
-		if (info && !info->va_fourcc)
+		if (info && (!info->linear || !info->va_fourcc))
 			src_convertible = true;
 
 		fmtdesc.index++;
@@ -534,10 +547,14 @@ static bool video_device_is_converter(const char *path,
 	while (ioctl(fd, VIDIOC_ENUM_FMT, &fmtdesc) >= 0) {
 		if (fmtdesc.pixelformat == V4L2_PIX_FMT_NV12) {
 			nv12_capture = true;
-			break;
 		}
+		if (fmtdesc.pixelformat == V4L2_PIX_FMT_P010)
+			conv->p010 = true;
 		fmtdesc.index++;
 	}
+	struct v4l2_queryctrl rotation = { .id = V4L2_CID_ROTATE };
+	conv->video_processing = ioctl(fd, VIDIOC_QUERYCTRL, &rotation) == 0 &&
+		!(rotation.flags & V4L2_CTRL_FLAG_DISABLED);
 
 	close(fd);
 	return src_convertible && nv12_capture;
@@ -630,7 +647,9 @@ static bool driver_supports_pixelformat(struct v4l2r_driver *drv,
 static bool driver_supports_hevc_10bit(struct v4l2r_driver *drv)
 {
 	for (unsigned int i = 0; i < drv->nb_decoders; i++) {
-		if (drv->decoders[i].hevc_10bit)
+		if (drv->decoders[i].hevc_10bit &&
+		    (!drv->decoders[i].tiled_10bit ||
+		     (drv->has_converter && drv->converter.p010)))
 			return true;
 	}
 
@@ -705,7 +724,7 @@ VAStatus v4l2r_QueryConfigEntrypoints(VADriverContextP va_ctx, VAProfile profile
 
 	if (profile == VAProfileNone) {
 		*num_entrypoints = 0;
-		if (v4l2r_converter_available(drv))
+		if (v4l2r_converter_available(drv) && drv->converter.video_processing)
 			entrypoints[(*num_entrypoints)++] =
 				VAEntrypointVideoProc;
 	} else if (codec && driver_supports_profile(drv, profile)) {
@@ -731,7 +750,7 @@ VAStatus v4l2r_CreateConfig(VADriverContextP va_ctx, VAProfile profile,
 		/* Video processing (rotation/mirroring/scaling blits) runs
 		 * on the format converter. */
 		if (entrypoint != VAEntrypointVideoProc ||
-		    !v4l2r_converter_available(drv))
+		    (!v4l2r_converter_available(drv) || !drv->converter.video_processing))
 			return VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT;
 	} else {
 		codec = v4l2r_codec_for_profile(profile);
@@ -1020,6 +1039,12 @@ VAStatus V4L2R_DRIVER_INIT(VADriverContextP va_ctx)
 	va_ctx->pDriverData = drv;
 
 	enumerate_decoders(drv);
+	/* Advertise tiled ten-bit decoding only with a usable lossless output path. */
+	for (unsigned int i = 0; i < drv->nb_decoders; i++)
+		if (drv->decoders[i].tiled_10bit) {
+			v4l2r_converter_available(drv);
+			break;
+		}
 	if (!drv->nb_decoders) {
 		v4l2r_log("no V4L2 Request API decoder found\n");
 		v4l2r_Terminate(va_ctx);

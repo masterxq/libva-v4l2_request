@@ -98,6 +98,7 @@ struct v4l2r_decoder {
 	 * device can do 10-bit (e.g. Allwinner A64 lacks it), and the kernel only
 	 * rejects it at decode time, so probe it up front and gate Main10. */
 	bool hevc_10bit;
+	bool tiled_10bit;
 };
 
 /*
@@ -107,6 +108,8 @@ struct v4l2r_decoder {
  * source (OUTPUT queue) formats the device can read.
  */
 struct v4l2r_converter {
+	bool p010;
+	bool video_processing;
 	char video_path[256];
 	char card[32];
 	uint32_t pixelformats[V4L2R_MAX_PIXELFORMATS];
@@ -563,7 +566,7 @@ bool v4l2r_converter_supports(struct v4l2r_driver *drv, uint32_t pixelformat);
 /* Set up the conversion chain for the context's selected CAPTURE format.
  * Called once from the CAPTURE setup path; on failure the context decodes
  * without conversion (and 10-bit output stays NV15). */
-VAStatus v4l2r_convert_setup(struct v4l2r_context *ctx);
+VAStatus v4l2r_convert_setup(struct v4l2r_context *ctx, struct v4l2r_surface *surface);
 void v4l2r_convert_destroy(struct v4l2r_context *ctx);
 
 /* Queue the conversion of a just-decoded CAPTURE buffer into its surface's

@@ -618,9 +618,10 @@ VAStatus v4l2r_context_bind_surface(struct v4l2r_context *ctx,
 				v4l2r_format_by_pixelformat(
 					v4l2r_format_pixelformat(&ctx->capture_format));
 
-			if (info && !info->va_fourcc) {
-				v4l2r_convert_setup(ctx);
-				if (!ctx->conv) {
+			if (info && (!info->va_fourcc ||
+			    (!info->linear && v4l2r_converter_supports(ctx->drv, info->pixelformat)))) {
+				v4l2r_convert_setup(ctx, surface);
+				if (!ctx->conv && !info->va_fourcc) {
 					v4l2r_log("no usable format converter for %.4s, "
 						  "refusing hardware decoding\n",
 						  (const char *)&info->pixelformat);

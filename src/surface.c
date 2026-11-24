@@ -178,19 +178,15 @@ VAStatus v4l2r_QuerySurfaceAttributes(VADriverContextP va_ctx, VAConfigID config
 	attrib_list[i].type = VASurfaceAttribPixelFormat;
 	attrib_list[i].flags = VA_SURFACE_ATTRIB_GETTABLE | VA_SURFACE_ATTRIB_SETTABLE;
 	attrib_list[i].value.type = VAGenericValueTypeInteger;
-	attrib_list[i].value.value.i = VA_FOURCC_NV12;
+	bool preserve = (cfg->rt_format & VA_RT_FORMAT_YUV420_10) &&
+		v4l2r_converter_available(drv) && drv->converter.p010;
+	bool only_p010 = preserve && !(cfg->rt_format & VA_RT_FORMAT_YUV420);
+	attrib_list[i].value.value.i = only_p010 ? VA_FOURCC_P010 : VA_FOURCC_NV12;
 	i++;
 
-	/*
-	 * With a format converter available, 10-bit configs hand out NV12
-	 * surfaces (decoders here produce packed NV15, which the converter
-	 * turns into NV12 in hardware; nothing can display NV15 directly).
-	 * Advertising P010 alongside would make FFmpeg pick it as the exact
-	 * match and bypass the converter, landing on the slow CPU readback
-	 * path, so it is only offered when no converter exists.
-	 */
-	if ((cfg->rt_format & VA_RT_FORMAT_YUV420_10) &&
-	    !v4l2r_converter_available(drv)) {
+	/* Preserve ten-bit output when the converter exports P010. */
+	if (!only_p010 && (cfg->rt_format & VA_RT_FORMAT_YUV420_10) &&
+	    (!v4l2r_converter_available(drv) || drv->converter.p010)) {
 		attrib_list[i].type = VASurfaceAttribPixelFormat;
 		attrib_list[i].flags = VA_SURFACE_ATTRIB_GETTABLE | VA_SURFACE_ATTRIB_SETTABLE;
 		attrib_list[i].value.type = VAGenericValueTypeInteger;
@@ -297,8 +293,10 @@ static VAStatus backing_alloc(struct v4l2r_driver *drv,
 	for (unsigned int i = 0; i < VIDEO_MAX_PLANES; i++)
 		backing->dmabuf_fd[i] = -1;
 
-	/* Try each enumerated decoder until one produces the layout. */
-	for (unsigned int n = 0; n < drv->nb_decoders; n++) {
+	/* The converter owns linear presentation storage; avoid decoder reconfiguration. */
+	for (unsigned int n = 0; n < drv->nb_decoders + (drv->has_converter ? 1u : 0u); n++) {
+		bool converter = drv->has_converter && n == 0;
+		unsigned int decoder = drv->has_converter ? (n ? n - 1 : 0) : n;
 		struct v4l2_capability capability = {0};
 		struct v4l2_create_buffers buffers;
 		struct v4l2_plane planes[VIDEO_MAX_PLANES] = {0};
@@ -308,7 +306,8 @@ static VAStatus backing_alloc(struct v4l2r_driver *drv,
 		bool mplane;
 		int fd;
 
-		fd = open(drv->decoders[n].video_path, O_RDWR | O_CLOEXEC);
+		fd = open(converter ? drv->converter.video_path : drv->decoders[decoder].video_path,
+			  O_RDWR | O_CLOEXEC);
 		if (fd < 0)
 			continue;
 
@@ -332,8 +331,8 @@ static VAStatus backing_alloc(struct v4l2r_driver *drv,
 				V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE :
 				V4L2_BUF_TYPE_VIDEO_OUTPUT,
 		};
-		uint32_t coded = drv->decoders[n].nb_pixelformats ?
-				 drv->decoders[n].pixelformats[0] : 0;
+		uint32_t coded = !converter && drv->decoders[decoder].nb_pixelformats ?
+				 drv->decoders[decoder].pixelformats[0] : 0;
 
 		if (mplane) {
 			out.fmt.pix_mp.width = width;
@@ -452,12 +451,11 @@ static VAStatus backing_alloc_default(struct v4l2r_driver *drv,
 	uint32_t pixelformat = V4L2_PIX_FMT_NV12;
 	VAStatus status;
 
-	/* With a converter around, 10-bit configs hand out NV12 surfaces;
-	 * bare P010 only works on decoders that produce it natively. */
+	/* Prefer P010 for ten-bit surfaces when the converter preserves precision. */
 	if (surface->fourcc == VA_FOURCC_P010 ||
 	    (!surface->fourcc &&
 	     (surface->rt_format & VA_RT_FORMAT_YUV420_10) &&
-	     !v4l2r_converter_available(drv)))
+	     (!v4l2r_converter_available(drv) || drv->converter.p010)))
 		pixelformat = V4L2_PIX_FMT_P010;
 
 	status = backing_alloc(drv, surface, surface->width, surface->height,
@@ -476,7 +474,7 @@ static VAStatus backing_alloc_default(struct v4l2r_driver *drv,
 }
 
 /*
- * Backing used as the destination of the format converter: NV12 with the
+ * Backing used as the destination of the format converter: linear storage with the
  * exact layout of the converter's CAPTURE format. Kept (not replaced by
  * the decode CAPTURE buffer) for the whole life of the bound surface.
  */
@@ -491,11 +489,18 @@ VAStatus v4l2r_surface_convert_backing(struct v4l2r_driver *drv,
 		return VA_STATUS_ERROR_OPERATION_FAILED;
 
 	pix_mp = &conv->capture_format.fmt.pix_mp;
+	const struct v4l2r_format_info *info =
+		v4l2r_format_by_pixelformat(pix_mp->pixelformat);
+	if (!info || (surface->fourcc && surface->fourcc != info->va_fourcc))
+		return VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT;
+
 
 	/* Backing left over from pre-decode probing may have the wrong
 	 * size; replace it. */
 	if (surface->backing &&
-	    (surface->backing->pixelformat != V4L2_PIX_FMT_NV12 ||
+	    (surface->backing->pixelformat != pix_mp->pixelformat ||
+	     surface->backing->width != pix_mp->width ||
+	     surface->backing->height != pix_mp->height ||
 	     surface->backing->nb_planes != 1 ||
 	     surface->backing->pitch != pix_mp->plane_fmt[0].bytesperline ||
 	     surface->backing->plane_size[0] < pix_mp->plane_fmt[0].sizeimage))
@@ -505,7 +510,7 @@ VAStatus v4l2r_surface_convert_backing(struct v4l2r_driver *drv,
 		return VA_STATUS_SUCCESS;
 
 	status = backing_alloc(drv, surface, pix_mp->width, pix_mp->height,
-			       V4L2_PIX_FMT_NV12);
+			       pix_mp->pixelformat);
 	if (status != VA_STATUS_SUCCESS)
 		return status;
 
@@ -617,7 +622,7 @@ VAStatus v4l2r_surface_view(struct v4l2r_driver *drv,
 	memset(view, 0, sizeof(*view));
 
 	/* With a conversion chain the decode CAPTURE buffer holds the raw
-	 * decoder format; what clients see is the converted NV12 backing. */
+	 * decoder format; clients see the converted NV12 or P010 backing. */
 	if (surface->ctx && surface->ctx->conv) {
 		if (!surface->backing &&
 		    v4l2r_surface_convert_backing(drv, surface) !=
@@ -693,7 +698,7 @@ static VAStatus fill_prime_descriptor(const struct v4l2r_frame_view *view,
 	desc->num_objects = view->nb_planes;
 
 	for (unsigned int i = 0; i < view->nb_planes; i++) {
-		int fd = dup(view->dmabuf_fd[i]);
+		int fd = fcntl(view->dmabuf_fd[i], F_DUPFD_CLOEXEC, 0);
 		if (fd < 0) {
 			for (unsigned int j = 0; j < i; j++)
 				close(desc->objects[j].fd);

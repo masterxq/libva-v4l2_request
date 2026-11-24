@@ -1,10 +1,11 @@
 /*
- * Format converter chain: decoder-only CAPTURE formats (the packed 10-bit
- * NV15 produced by Rockchip decoders) are converted to NV12 with a plain
- * V4L2 mem2mem device (the Rockchip RGA), fully in hardware.
+ * Format converter chain: a plain V4L2 mem2mem device turns decoder
+ * reference layouts into presentation buffers, without CPU detiling.
+ * MediaTek MM21 becomes NV12; MT2110 retains ten bits in P010. The existing
+ * Rockchip NV15-to-NV12 path is retained for converters without P010.
  *
  * The decoder's CAPTURE buffer is imported into the converter's OUTPUT
- * queue and the surface's standalone NV12 backing into its CAPTURE queue,
+ * queue and the surface's standalone linear backing into its CAPTURE queue,
  * both as dma-bufs, so no pixel ever passes through the CPU. Conversions
  * are kicked as soon as a decode finishes (from the CAPTURE dequeue path)
  * and overlap subsequent decodes; readers wait for the result through
@@ -42,7 +43,7 @@
 #define V4L2R_VPP_MIN_DIM 34
 #define V4L2R_VPP_MAX_DIM 8192
 
-VAStatus v4l2r_convert_setup(struct v4l2r_context *ctx)
+VAStatus v4l2r_convert_setup(struct v4l2r_context *ctx, struct v4l2r_surface *surface)
 {
 	struct v4l2r_driver *drv = ctx->drv;
 	struct v4l2r_convert *conv;
@@ -51,19 +52,30 @@ VAStatus v4l2r_convert_setup(struct v4l2r_context *ctx)
 	uint32_t src_pixelformat = v4l2r_format_pixelformat(&ctx->capture_format);
 	uint32_t width = v4l2r_format_width(&ctx->capture_format);
 	uint32_t height = v4l2r_format_height(&ctx->capture_format);
+	uint32_t target_height = height;
 
 	if (!v4l2r_converter_supports(drv, src_pixelformat))
 		return VA_STATUS_ERROR_OPERATION_FAILED;
 
-	/* Importing into the converter needs a single memory plane. */
-	if (v4l2r_format_num_planes(&ctx->capture_format) != 1)
+	const struct v4l2r_format_info *info = v4l2r_format_by_pixelformat(src_pixelformat);
+	bool preserve = info && info->bit_depth == 10 && drv->converter.p010;
+	uint32_t target_format = preserve ? V4L2_PIX_FMT_P010 : V4L2_PIX_FMT_NV12;
+	unsigned int source_planes = v4l2r_format_num_planes(&ctx->capture_format);
+	if (!source_planes || source_planes > VIDEO_MAX_PLANES)
 		return VA_STATUS_ERROR_OPERATION_FAILED;
+	if (source_planes > 1)
+		target_height = surface->backing ? surface->backing->height : surface->height;
+#if defined(V4L2_PIX_FMT_MT2110T) && defined(V4L2_PIX_FMT_MT2110R)
+	if ((src_pixelformat == V4L2_PIX_FMT_MT2110T || src_pixelformat == V4L2_PIX_FMT_MT2110R) &&
+	    !preserve)
+		return VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT;
+#endif
 
 	conv = calloc(1, sizeof(*conv));
 	if (!conv)
 		return VA_STATUS_ERROR_ALLOCATION_FAILED;
 
-	conv->fd = open(drv->converter.video_path, O_RDWR | O_NONBLOCK);
+	conv->fd = open(drv->converter.video_path, O_RDWR | O_NONBLOCK | O_CLOEXEC);
 	if (conv->fd < 0)
 		goto fail;
 
@@ -76,38 +88,66 @@ VAStatus v4l2r_convert_setup(struct v4l2r_context *ctx)
 	conv->output_format.fmt.pix_mp.pixelformat = src_pixelformat;
 	conv->output_format.fmt.pix_mp.width = width;
 	conv->output_format.fmt.pix_mp.height = height;
-	conv->output_format.fmt.pix_mp.num_planes = 1;
+	conv->output_format.fmt.pix_mp.num_planes = source_planes;
+	for (unsigned int p = 0; p < source_planes; p++)
+		conv->output_format.fmt.pix_mp.plane_fmt[p].bytesperline =
+			V4L2_TYPE_IS_MULTIPLANAR(ctx->capture_format.type) ?
+			ctx->capture_format.fmt.pix_mp.plane_fmt[p].bytesperline :
+			ctx->capture_format.fmt.pix.bytesperline;
 	if (ioctl(conv->fd, VIDIOC_S_FMT, &conv->output_format) < 0)
 		goto fail;
 
 	if (conv->output_format.fmt.pix_mp.pixelformat != src_pixelformat ||
 	    conv->output_format.fmt.pix_mp.width != width ||
 	    conv->output_format.fmt.pix_mp.height != height ||
+	    conv->output_format.fmt.pix_mp.num_planes != source_planes ||
 	    v4l2r_format_bytesperline(&conv->output_format) !=
 	    v4l2r_format_bytesperline(&ctx->capture_format)) {
-		v4l2r_log("converter source layout mismatch for %.4s %ux%u\n",
-			  (const char *)&src_pixelformat, width, height);
+		v4l2r_log("converter source layout mismatch for %.4s: %ux%u/%u/%u -> %.4s %ux%u/%u/%u\n",
+			  (const char *)&src_pixelformat, width, height, source_planes,
+			  v4l2r_format_bytesperline(&ctx->capture_format),
+			  (const char *)&conv->output_format.fmt.pix_mp.pixelformat,
+			  conv->output_format.fmt.pix_mp.width, conv->output_format.fmt.pix_mp.height,
+			  conv->output_format.fmt.pix_mp.num_planes,
+			  v4l2r_format_bytesperline(&conv->output_format));
 		goto fail;
+	}
+
+	for (unsigned int p = 0; p < source_planes; p++) {
+		uint32_t expected_pitch = V4L2_TYPE_IS_MULTIPLANAR(ctx->capture_format.type) ?
+			ctx->capture_format.fmt.pix_mp.plane_fmt[p].bytesperline :
+			ctx->capture_format.fmt.pix.bytesperline;
+		if (conv->output_format.fmt.pix_mp.plane_fmt[p].bytesperline != expected_pitch)
+			goto fail;
 	}
 
 	conv->capture_format = (struct v4l2_format) {
 		.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
 	};
-	conv->capture_format.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_NV12;
+	conv->capture_format.fmt.pix_mp.pixelformat = target_format;
 	conv->capture_format.fmt.pix_mp.width = width;
-	conv->capture_format.fmt.pix_mp.height = height;
+	conv->capture_format.fmt.pix_mp.height = target_height;
 	conv->capture_format.fmt.pix_mp.num_planes = 1;
 	if (ioctl(conv->fd, VIDIOC_S_FMT, &conv->capture_format) < 0)
 		goto fail;
 
-	if (conv->capture_format.fmt.pix_mp.pixelformat != V4L2_PIX_FMT_NV12 ||
+	if (conv->capture_format.fmt.pix_mp.pixelformat != target_format ||
 	    conv->capture_format.fmt.pix_mp.width != width ||
-	    conv->capture_format.fmt.pix_mp.height != height ||
+	    conv->capture_format.fmt.pix_mp.height != target_height ||
 	    conv->capture_format.fmt.pix_mp.num_planes != 1) {
 		v4l2r_log("converter cannot produce NV12 at %ux%u\n",
 			  width, height);
 		goto fail;
 	}
+
+	struct v4l2_selection selection = {
+		.type = V4L2_BUF_TYPE_VIDEO_OUTPUT,
+		.target = V4L2_SEL_TGT_CROP,
+		.r = { .width = width, .height = ctx->picture_height < height ?
+			ctx->picture_height : height },
+	};
+	if (source_planes > 1 && ioctl(conv->fd, VIDIOC_S_SELECTION, &selection) < 0)
+		goto fail;
 
 	reqbufs = (struct v4l2_requestbuffers) {
 		.count = V4L2R_CONVERT_SLOTS,
@@ -139,8 +179,8 @@ VAStatus v4l2r_convert_setup(struct v4l2r_context *ctx)
 
 	ctx->conv = conv;
 
-	v4l2r_log("converting %.4s to NV12 via %s [%s]\n",
-		  (const char *)&src_pixelformat, drv->converter.video_path,
+	v4l2r_log("converting %.4s to %.4s via %s [%s]\n",
+		  (const char *)&src_pixelformat, (const char *)&target_format, drv->converter.video_path,
 		  drv->converter.card);
 
 	return VA_STATUS_SUCCESS;
@@ -172,6 +212,25 @@ void v4l2r_convert_destroy(struct v4l2r_context *ctx)
 	ctx->conv = NULL;
 }
 
+/* STREAMOFF is the ownership boundary: no decoder buffer is reusable before it. */
+static void convert_fail(struct v4l2r_context *ctx)
+{
+	struct v4l2r_convert *conv = ctx->conv;
+	enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
+
+	conv->failed = true;
+	ioctl(conv->fd, VIDIOC_STREAMOFF, &type);
+	type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+	ioctl(conv->fd, VIDIOC_STREAMOFF, &type);
+	for (unsigned int i = 0; i < V4L2R_CONVERT_SLOTS; i++) {
+		if ((conv->busy & (1u << i)) && conv->jobs[i].surface)
+			conv->jobs[i].surface->convert_pending = false;
+		conv->jobs[i].surface = NULL;
+		conv->jobs[i].capture_index = -1;
+	}
+	conv->busy = 0;
+}
+
 /*
  * Reap finished conversions. Nonblocking unless wait is set, in which case
  * at least one in-flight job is waited for. Returns the number of reaped
@@ -196,15 +255,25 @@ static int convert_reap(struct v4l2r_context *ctx, bool wait)
 		};
 
 		if (ioctl(conv->fd, VIDIOC_DQBUF, &buffer) < 0) {
-			if (errno != EAGAIN)
-				return -errno;
+			if (errno != EAGAIN) {
+				convert_fail(ctx);
+				return -EIO;
+			}
 
 			if (!wait || reaped)
 				break;
 
-			if (poll(&pollfd, 1, V4L2R_CONVERT_TIMEOUT_MS) <= 0)
+			if (poll(&pollfd, 1, V4L2R_CONVERT_TIMEOUT_MS) <= 0) {
+				convert_fail(ctx);
 				return -EIO;
+			}
 			continue;
+		}
+
+		if ((buffer.flags & V4L2_BUF_FLAG_ERROR) || buffer.index >= V4L2R_CONVERT_SLOTS ||
+		    !(conv->busy & (1u << buffer.index))) {
+			convert_fail(ctx);
+			return -EIO;
 		}
 
 		if (buffer.index < V4L2R_CONVERT_SLOTS &&
@@ -224,7 +293,7 @@ static int convert_reap(struct v4l2r_context *ctx, bool wait)
 		buffer = (struct v4l2_buffer) {
 			.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE,
 			.memory = V4L2_MEMORY_DMABUF,
-			.length = 1,
+			.length = conv->output_format.fmt.pix_mp.num_planes,
 			.m.planes = planes,
 		};
 		if (ioctl(conv->fd, VIDIOC_DQBUF, &buffer) < 0) {
@@ -232,7 +301,8 @@ static int convert_reap(struct v4l2r_context *ctx, bool wait)
 			 * would fail anyway; disable the chain explicitly. */
 			v4l2r_log("failed to dequeue converter source: %s\n",
 				  strerror(errno));
-			conv->failed = true;
+			convert_fail(ctx);
+			return -EIO;
 		}
 	}
 
@@ -258,7 +328,8 @@ void v4l2r_convert_kick(struct v4l2r_context *ctx, int capture_index)
 	if (!surface)
 		return;
 
-	convert_reap(ctx, false);
+	if (convert_reap(ctx, false) < 0 || conv->failed)
+		return;
 
 	/* All slots busy: wait one out. */
 	while (conv->busy & (1u << conv->next_slot)) {
@@ -274,32 +345,35 @@ void v4l2r_convert_kick(struct v4l2r_context *ctx, int capture_index)
 	    VA_STATUS_SUCCESS) {
 		if (!conv->failed)
 			v4l2r_log("no conversion backing for surface, output will be wrong\n");
-		conv->failed = true;
+		convert_fail(ctx);
 		return;
 	}
 
-	if (v4l2r_export_capture_dmabufs(ctx, capture, capture_index) < 0)
+	if (v4l2r_export_capture_dmabufs(ctx, capture, capture_index) < 0) {
+		convert_fail(ctx);
 		return;
+	}
 
 	/* For DMABUF the plane length must carry the dma-buf size: the
 	 * kernel validates bytesused against it before resolving the fd
 	 * (and the decoder's buffer is larger than the image anyway). */
 	memset(planes, 0, sizeof(planes));
-	planes[0].m.fd = capture->dmabuf_fd[0];
-	planes[0].length = capture->plane_size[0];
-	planes[0].bytesused =
-		conv->output_format.fmt.pix_mp.plane_fmt[0].sizeimage;
+	for (unsigned int p = 0; p < capture->nb_planes; p++) {
+		planes[p].m.fd = capture->dmabuf_fd[p];
+		planes[p].length = capture->plane_size[p];
+		planes[p].bytesused = conv->output_format.fmt.pix_mp.plane_fmt[p].sizeimage;
+	}
 	buffer = (struct v4l2_buffer) {
 		.index = slot,
 		.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE,
 		.memory = V4L2_MEMORY_DMABUF,
-		.length = 1,
+		.length = capture->nb_planes,
 		.m.planes = planes,
 	};
 	if (ioctl(conv->fd, VIDIOC_QBUF, &buffer) < 0) {
 		v4l2r_log("failed to queue converter source: %s\n",
 			  strerror(errno));
-		conv->failed = true;
+		convert_fail(ctx);
 		return;
 	}
 
@@ -316,7 +390,7 @@ void v4l2r_convert_kick(struct v4l2r_context *ctx, int capture_index)
 	if (ioctl(conv->fd, VIDIOC_QBUF, &buffer) < 0) {
 		v4l2r_log("failed to queue converter destination: %s\n",
 			  strerror(errno));
-		conv->failed = true;
+		convert_fail(ctx);
 		return;
 	}
 
@@ -358,6 +432,8 @@ VAStatus v4l2r_convert_wait(struct v4l2r_surface *surface)
 
 	if (!ctx || !ctx->conv)
 		return VA_STATUS_SUCCESS;
+	if (ctx->conv->failed)
+		return VA_STATUS_ERROR_OPERATION_FAILED;
 
 	pthread_mutex_lock(&ctx->mutex);
 	while (surface->convert_pending) {
@@ -370,10 +446,13 @@ VAStatus v4l2r_convert_wait(struct v4l2r_surface *surface)
 
 		/* Nothing in flight can clear the flag anymore. */
 		if (!ctx->conv->busy && surface->convert_pending) {
-			surface->convert_pending = false;
+			convert_fail(ctx);
+			status = VA_STATUS_ERROR_OPERATION_FAILED;
 			break;
 		}
 	}
+	if (ctx->conv->failed)
+		status = VA_STATUS_ERROR_OPERATION_FAILED;
 	pthread_mutex_unlock(&ctx->mutex);
 
 	return status;
