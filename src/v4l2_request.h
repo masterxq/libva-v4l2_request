@@ -26,6 +26,7 @@
 #ifndef V4L2_REQUEST_H
 #define V4L2_REQUEST_H
 
+#include <stdatomic.h>
 #include <linux/videodev2.h>
 #include <pthread.h>
 #include <stdbool.h>
@@ -159,6 +160,8 @@ struct v4l2r_config {
  * surfaces while probing formats.
  */
 struct v4l2r_surface_backing {
+	struct v4l2r_driver *owner;
+	size_t accounted;
 	uint32_t pixelformat;
 	uint32_t width;
 	uint32_t height;
@@ -170,6 +173,8 @@ struct v4l2r_surface_backing {
 };
 
 struct v4l2r_surface {
+	struct v4l2r_driver *drv;
+	bool failed;
 	struct v4l2r_context *ctx;	/* context the surface is bound to */
 	VASurfaceID id;			/* own VA id, for logging/tracing */
 	unsigned int width;
@@ -253,6 +258,8 @@ struct v4l2r_buffer {
 	/* Set for images derived from a surface: data points into the
 	 * CAPTURE buffer mapping and must not be freed. */
 	bool derived;
+	int derived_fd;
+	unsigned int map_count;
 };
 
 struct v4l2r_image {
@@ -374,6 +381,8 @@ struct v4l2r_codec {
 void v4l2r_flush_surface(struct v4l2r_surface *surface);
 
 struct v4l2r_driver {
+	pthread_rwlock_t surface_lock;
+	atomic_size_t backing_bytes;
 	struct v4l2r_handles configs;
 	struct v4l2r_handles contexts;
 	struct v4l2r_handles surfaces;
@@ -634,6 +643,7 @@ VAStatus v4l2r_QueryVideoProcPipelineCaps(VADriverContextP va_ctx,
 /* Make a surface's pixels available for reading: submit a held-back decode,
  * wait for the decode itself and for any pending format conversion. */
 VAStatus v4l2r_surface_ready(struct v4l2r_surface *surface);
+VAStatus v4l2r_surface_ready_unlocked(struct v4l2r_surface *surface);
 
 /* View of a bound surface's decode CAPTURE buffer itself, even when a
  * conversion chain makes v4l2r_surface_view() present the converted backing

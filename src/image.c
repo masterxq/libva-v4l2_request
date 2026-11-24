@@ -8,6 +8,7 @@
  */
 
 #include <errno.h>
+#include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
@@ -15,6 +16,7 @@
 #include <unistd.h>
 
 #include <linux/videodev2.h>
+#include <linux/dma-buf.h>
 
 #include "v4l2_request.h"
 
@@ -118,7 +120,7 @@ fail:
 	return status;
 }
 
-VAStatus v4l2r_DeriveImage(VADriverContextP va_ctx, VASurfaceID surface_id,
+static VAStatus derive_image(VADriverContextP va_ctx, VASurfaceID surface_id,
 			   VAImage *image)
 {
 	struct v4l2r_driver *drv = v4l2r_driver(va_ctx);
@@ -135,11 +137,11 @@ VAStatus v4l2r_DeriveImage(VADriverContextP va_ctx, VASurfaceID surface_id,
 		return VA_STATUS_ERROR_INVALID_SURFACE;
 
 	/* Wait out any held-back decode and pending conversion first. */
-	status = v4l2r_surface_ready(surface);
+	status = v4l2r_surface_ready_unlocked(surface);
 	if (status != VA_STATUS_SUCCESS)
 		return status;
 
-	status = v4l2r_surface_view(drv, surface, true, &view);
+	status = v4l2r_surface_view(drv, surface, false, &view);
 	if (status != VA_STATUS_SUCCESS)
 		return status;
 
@@ -202,13 +204,35 @@ VAStatus v4l2r_DeriveImage(VADriverContextP va_ctx, VASurfaceID surface_id,
 	buffer->type = VAImageBufferType;
 	buffer->element_size = image->data_size;
 	buffer->nb_elements = 1;
-	buffer->data = view.map[0];
 	buffer->derived = true;
+	buffer->derived_fd = fcntl(view.dmabuf_fd[0], F_DUPFD_CLOEXEC, 0);
+	buffer->data = MAP_FAILED;
+	if (buffer->derived_fd >= 0)
+		buffer->data = mmap(NULL, image->data_size, PROT_READ | PROT_WRITE,
+				    MAP_SHARED, buffer->derived_fd, 0);
+	if (buffer->data == MAP_FAILED) {
+		v4l2r_DestroyBuffer(va_ctx, buffer_id);
+		pthread_mutex_lock(&drv->mutex);
+		v4l2r_handles_free(&drv->images, image_id);
+		pthread_mutex_unlock(&drv->mutex);
+		return VA_STATUS_ERROR_ALLOCATION_FAILED;
+	}
 
 	image->buf = buffer_id;
 	image_object->image = *image;
 
 	return VA_STATUS_SUCCESS;
+}
+
+VAStatus v4l2r_DeriveImage(VADriverContextP va_ctx, VASurfaceID surface, VAImage *image)
+{
+	struct v4l2r_driver *drv = v4l2r_driver(va_ctx);
+	VAStatus status;
+
+	pthread_rwlock_rdlock(&drv->surface_lock);
+	status = derive_image(va_ctx, surface, image);
+	pthread_rwlock_unlock(&drv->surface_lock);
+	return status;
 }
 
 VAStatus v4l2r_DestroyImage(VADriverContextP va_ctx, VAImageID image_id)
@@ -302,7 +326,7 @@ static VAStatus get_image_mm21(const struct v4l2r_frame_view *view,
 }
 #endif
 
-VAStatus v4l2r_GetImage(VADriverContextP va_ctx, VASurfaceID surface_id,
+static VAStatus get_image(VADriverContextP va_ctx, VASurfaceID surface_id,
 			int x, int y, unsigned int width, unsigned int height,
 			VAImageID image_id)
 {
@@ -330,7 +354,7 @@ VAStatus v4l2r_GetImage(VADriverContextP va_ctx, VASurfaceID surface_id,
 		return VA_STATUS_ERROR_OPERATION_FAILED;
 
 	/* Wait out any held-back decode and pending conversion first. */
-	status = v4l2r_surface_ready(surface);
+	status = v4l2r_surface_ready_unlocked(surface);
 	if (status != VA_STATUS_SUCCESS)
 		return status;
 
@@ -398,6 +422,49 @@ VAStatus v4l2r_GetImage(VADriverContextP va_ctx, VASurfaceID surface_id,
 		       src_chroma + i * view.pitch, row_size);
 
 	return VA_STATUS_SUCCESS;
+}
+
+static VAStatus get_image_synced(VADriverContextP va_ctx, VASurfaceID surface_id,
+		       int x, int y, unsigned int width, unsigned int height, VAImageID image_id)
+{
+	struct v4l2r_driver *drv = v4l2r_driver(va_ctx);
+	struct v4l2r_surface *surface = V4L2R_SURFACE_GET(drv, surface_id);
+	struct v4l2r_frame_view view;
+	VAStatus status;
+	unsigned int started = 0;
+	struct dma_buf_sync sync = { .flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ };
+
+	if (!surface)
+		return VA_STATUS_ERROR_INVALID_SURFACE;
+	status = v4l2r_surface_ready_unlocked(surface);
+	if (status != VA_STATUS_SUCCESS)
+		return status;
+	status = v4l2r_surface_view(drv, surface, false, &view);
+	if (status != VA_STATUS_SUCCESS)
+		return status;
+	for (; started < view.nb_planes; started++)
+		if (ioctl(view.dmabuf_fd[started], DMA_BUF_IOCTL_SYNC, &sync) < 0)
+			break;
+	status = started == view.nb_planes ?
+		get_image(va_ctx, surface_id, x, y, width, height, image_id) :
+		VA_STATUS_ERROR_OPERATION_FAILED;
+	sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
+	while (started)
+		if (ioctl(view.dmabuf_fd[--started], DMA_BUF_IOCTL_SYNC, &sync) < 0)
+			status = VA_STATUS_ERROR_OPERATION_FAILED;
+	return status;
+}
+
+VAStatus v4l2r_GetImage(VADriverContextP va_ctx, VASurfaceID surface,
+		       int x, int y, unsigned int width, unsigned int height, VAImageID image)
+{
+	struct v4l2r_driver *drv = v4l2r_driver(va_ctx);
+	VAStatus status;
+
+	pthread_rwlock_rdlock(&drv->surface_lock);
+	status = get_image_synced(va_ctx, surface, x, y, width, height, image);
+	pthread_rwlock_unlock(&drv->surface_lock);
+	return status;
 }
 
 VAStatus v4l2r_PutImage(VADriverContextP va_ctx, VASurfaceID surface_id,

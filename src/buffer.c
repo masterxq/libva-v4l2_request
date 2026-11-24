@@ -11,6 +11,10 @@
  */
 
 #include <stdlib.h>
+#include <linux/dma-buf.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <unistd.h>
 #include <string.h>
 
 #include "v4l2_request.h"
@@ -99,6 +103,14 @@ VAStatus v4l2r_MapBuffer(VADriverContextP va_ctx, VABufferID buf_id, void **pbuf
 	if (!buffer)
 		return VA_STATUS_ERROR_INVALID_BUFFER;
 
+	if (buffer->derived) {
+		if (!buffer->map_count) {
+			struct dma_buf_sync sync = { .flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_RW };
+			if (ioctl(buffer->derived_fd, DMA_BUF_IOCTL_SYNC, &sync) < 0)
+				return VA_STATUS_ERROR_OPERATION_FAILED;
+		}
+		buffer->map_count++;
+	}
 	*pbuf = buffer->data;
 	return VA_STATUS_SUCCESS;
 }
@@ -112,6 +124,11 @@ VAStatus v4l2r_UnmapBuffer(VADriverContextP va_ctx, VABufferID buf_id)
 	if (!buffer)
 		return VA_STATUS_ERROR_INVALID_BUFFER;
 
+	if (buffer->derived && buffer->map_count && !--buffer->map_count) {
+		struct dma_buf_sync sync = { .flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_RW };
+		if (ioctl(buffer->derived_fd, DMA_BUF_IOCTL_SYNC, &sync) < 0)
+			return VA_STATUS_ERROR_OPERATION_FAILED;
+	}
 	return VA_STATUS_SUCCESS;
 }
 
@@ -128,8 +145,18 @@ VAStatus v4l2r_DestroyBuffer(VADriverContextP va_ctx, VABufferID buf_id)
 	}
 
 	/* Derived image buffers point into the CAPTURE buffer mapping. */
-	if (!buffer->derived)
+	if (!buffer->derived) {
 		free(buffer->data);
+	} else {
+		if (buffer->map_count) {
+			struct dma_buf_sync sync = { .flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_RW };
+			ioctl(buffer->derived_fd, DMA_BUF_IOCTL_SYNC, &sync);
+		}
+		if (buffer->data && buffer->data != MAP_FAILED)
+			munmap(buffer->data, buffer->element_size);
+		if (buffer->derived_fd >= 0)
+			close(buffer->derived_fd);
+	}
 
 	v4l2r_handles_free(&drv->buffers, buf_id);
 	pthread_mutex_unlock(&drv->mutex);

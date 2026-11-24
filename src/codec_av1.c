@@ -859,6 +859,7 @@ static VAStatus av1_end_picture(struct v4l2r_context *ctx)
 		ctx->pic.target->codec_tag = codec->va_pic.order_hint;
 		ctx->pic.target->ctx = ctx;
 		ctx->pic.target->status = VASurfaceRendering;
+		ctx->pic.target->failed = false;
 	}
 
 	return VA_STATUS_SUCCESS;

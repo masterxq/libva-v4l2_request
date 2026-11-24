@@ -55,6 +55,7 @@ VAStatus v4l2r_CreateSurfaces2(VADriverContextP va_ctx, unsigned int format,
 		if (!surface)
 			goto fail;
 
+		surface->drv = drv;
 		surface->id = id;
 		surface->width = width;
 		surface->height = height;
@@ -84,7 +85,7 @@ VAStatus v4l2r_CreateSurfaces(VADriverContextP va_ctx, int width, int height,
 				     num_surfaces, NULL, 0);
 }
 
-VAStatus v4l2r_DestroySurfaces(VADriverContextP va_ctx, VASurfaceID *surface_list,
+static VAStatus destroy_surfaces(VADriverContextP va_ctx, VASurfaceID *surface_list,
 			       int num_surfaces)
 {
 	struct v4l2r_driver *drv = v4l2r_driver(va_ctx);
@@ -101,7 +102,7 @@ VAStatus v4l2r_DestroySurfaces(VADriverContextP va_ctx, VASurfaceID *surface_lis
 		 * with the context (V4L2 cannot free single buffers) but is
 		 * detached from the surface and returned to the free pool
 		 * for reuse by later decodes. */
-		v4l2r_surface_ready(surface);
+		v4l2r_surface_ready_unlocked(surface);
 		if (surface->ctx && surface->capture_index >= 0)
 			v4l2r_context_release_capture(surface->ctx,
 						      surface->capture_index);
@@ -116,6 +117,17 @@ VAStatus v4l2r_DestroySurfaces(VADriverContextP va_ctx, VASurfaceID *surface_lis
 	return VA_STATUS_SUCCESS;
 }
 
+VAStatus v4l2r_DestroySurfaces(VADriverContextP va_ctx, VASurfaceID *surfaces, int count)
+{
+	struct v4l2r_driver *drv = v4l2r_driver(va_ctx);
+	VAStatus status;
+
+	pthread_rwlock_rdlock(&drv->surface_lock);
+	status = destroy_surfaces(va_ctx, surfaces, count);
+	pthread_rwlock_unlock(&drv->surface_lock);
+	return status;
+}
+
 VAStatus v4l2r_SyncSurface(VADriverContextP va_ctx, VASurfaceID render_target)
 {
 	struct v4l2r_driver *drv = v4l2r_driver(va_ctx);
@@ -128,7 +140,7 @@ VAStatus v4l2r_SyncSurface(VADriverContextP va_ctx, VASurfaceID render_target)
 	return v4l2r_surface_ready(surface);
 }
 
-VAStatus v4l2r_QuerySurfaceStatus(VADriverContextP va_ctx,
+static VAStatus query_surface_status(VADriverContextP va_ctx,
 				  VASurfaceID render_target,
 				  VASurfaceStatus *status)
 {
@@ -153,6 +165,18 @@ VAStatus v4l2r_QuerySurfaceStatus(VADriverContextP va_ctx,
 		*status = VASurfaceRendering;
 
 	return VA_STATUS_SUCCESS;
+}
+
+VAStatus v4l2r_QuerySurfaceStatus(VADriverContextP va_ctx, VASurfaceID surface,
+				  VASurfaceStatus *state)
+{
+	struct v4l2r_driver *drv = v4l2r_driver(va_ctx);
+	VAStatus status;
+
+	pthread_rwlock_rdlock(&drv->surface_lock);
+	status = query_surface_status(va_ctx, surface, state);
+	pthread_rwlock_unlock(&drv->surface_lock);
+	return status;
 }
 
 VAStatus v4l2r_QuerySurfaceAttributes(VADriverContextP va_ctx, VAConfigID config,
@@ -234,10 +258,12 @@ VAStatus v4l2r_QuerySurfaceAttributes(VADriverContextP va_ctx, VAConfigID config
  * back for reordering, wait for the decode itself, then for any pending
  * format conversion into the backing.
  */
-VAStatus v4l2r_surface_ready(struct v4l2r_surface *surface)
+VAStatus v4l2r_surface_ready_unlocked(struct v4l2r_surface *surface)
 {
 	VAStatus status;
 
+	if (surface->failed)
+		return VA_STATUS_ERROR_DECODING_ERROR;
 	v4l2r_flush_surface(surface);
 
 	if (!surface->ctx || surface->capture_index < 0)
@@ -252,6 +278,17 @@ VAStatus v4l2r_surface_ready(struct v4l2r_surface *surface)
 		return status;
 
 	return v4l2r_convert_wait(surface);
+}
+
+VAStatus v4l2r_surface_ready(struct v4l2r_surface *surface)
+{
+	struct v4l2r_driver *drv = surface->drv;
+	VAStatus status;
+
+	pthread_rwlock_rdlock(&drv->surface_lock);
+	status = v4l2r_surface_ready_unlocked(surface);
+	pthread_rwlock_unlock(&drv->surface_lock);
+	return status;
 }
 
 /* --- standalone surface backing --- */
@@ -270,6 +307,9 @@ void v4l2r_surface_free_backing(struct v4l2r_surface *surface)
 			close(backing->dmabuf_fd[i]);
 	}
 
+	if (backing->accounted)
+		atomic_fetch_sub_explicit(&backing->owner->backing_bytes, backing->accounted,
+					  memory_order_relaxed);
 	free(backing);
 	surface->backing = NULL;
 }
@@ -290,6 +330,7 @@ static VAStatus backing_alloc(struct v4l2r_driver *drv,
 	backing = calloc(1, sizeof(*backing));
 	if (!backing)
 		return VA_STATUS_ERROR_ALLOCATION_FAILED;
+	backing->owner = drv;
 	for (unsigned int i = 0; i < VIDEO_MAX_PLANES; i++)
 		backing->dmabuf_fd[i] = -1;
 
@@ -411,6 +452,19 @@ static VAStatus backing_alloc(struct v4l2r_driver *drv,
 			backing->plane_size[0] = buffer.length;
 		}
 
+		size_t bytes = 0;
+		for (unsigned int i = 0; i < backing->nb_planes; i++)
+			bytes += backing->plane_size[i];
+		/* Bound driver-owned presentation storage, including exported backings. */
+		if (atomic_fetch_add_explicit(&drv->backing_bytes, bytes, memory_order_relaxed) +
+		    bytes > (size_t)512 * 1024 * 1024) {
+			atomic_fetch_sub_explicit(&drv->backing_bytes, bytes, memory_order_relaxed);
+			close(fd);
+			free(backing);
+			return VA_STATUS_ERROR_ALLOCATION_FAILED;
+		}
+		backing->accounted = bytes;
+
 		for (unsigned int i = 0; i < backing->nb_planes; i++) {
 			struct v4l2_exportbuffer exportbuffer = {
 				.type = format.type,
@@ -437,6 +491,10 @@ static VAStatus backing_alloc(struct v4l2r_driver *drv,
 		return VA_STATUS_SUCCESS;
 
 next:
+		if (backing->accounted) {
+			atomic_fetch_sub_explicit(&drv->backing_bytes, backing->accounted, memory_order_relaxed);
+			backing->accounted = 0;
+		}
 		close(fd);
 	}
 
@@ -782,7 +840,7 @@ static VAStatus fill_prime_descriptor(const struct v4l2r_frame_view *view,
 	return VA_STATUS_SUCCESS;
 }
 
-VAStatus v4l2r_ExportSurfaceHandle(VADriverContextP va_ctx, VASurfaceID surface_id,
+static VAStatus export_surface_handle(VADriverContextP va_ctx, VASurfaceID surface_id,
 				   uint32_t mem_type, uint32_t flags,
 				   void *descriptor)
 {
@@ -803,13 +861,27 @@ VAStatus v4l2r_ExportSurfaceHandle(VADriverContextP va_ctx, VASurfaceID surface_
 	 * conversion) to finish so a consumer that does not vaSyncSurface()
 	 * itself (e.g. --vo=dmabuf-wayland) cannot read a partially decoded
 	 * frame. No-op for unbound or already-idle surfaces. */
-	v4l2r_surface_ready(surface);
+	VAStatus ready = v4l2r_surface_ready_unlocked(surface);
+	if (ready != VA_STATUS_SUCCESS)
+		return ready;
 
 	status = v4l2r_surface_view(drv, surface, false, &view);
 	if (status != VA_STATUS_SUCCESS)
 		return status;
 
 	return fill_prime_descriptor(&view, flags, descriptor);
+}
+
+VAStatus v4l2r_ExportSurfaceHandle(VADriverContextP va_ctx, VASurfaceID surface,
+				   uint32_t memory_type, uint32_t flags, void *descriptor)
+{
+	struct v4l2r_driver *drv = v4l2r_driver(va_ctx);
+	VAStatus status;
+
+	pthread_rwlock_rdlock(&drv->surface_lock);
+	status = export_surface_handle(va_ctx, surface, memory_type, flags, descriptor);
+	pthread_rwlock_unlock(&drv->surface_lock);
+	return status;
 }
 
 /* --- unsupported display path --- */

@@ -189,9 +189,17 @@ static int dequeue_buffer(struct v4l2r_context *ctx, enum v4l2_buf_type type)
 		buffer.m.planes = planes;
 	}
 
-	if (ioctl(ctx->video_fd, VIDIOC_DQBUF, &buffer) < 0)
+	if (ioctl(ctx->video_fd, VIDIOC_DQBUF, &buffer) < 0) {
+		if (errno != EAGAIN)
+			v4l2r_log("decoder dequeue failed: type=%u errno=%d\n", type, errno);
 		return -errno;
+	}
 
+	/* An error is reported per frame: only the affected surface fails,
+	 * later frames of the same stream may decode fine again. */
+	if (buffer.flags & V4L2_BUF_FLAG_ERROR)
+		v4l2r_log("decoder reported an error on %s buffer %u\n",
+			  V4L2_TYPE_IS_OUTPUT(type) ? "OUTPUT" : "CAPTURE", buffer.index);
 	if (V4L2_TYPE_IS_OUTPUT(type)) {
 		ctx->queued_output &= ~(1u << buffer.index);
 		v4l2r_trace("DQBUF OUTPUT  #%u (bitstream consumed)\n",
@@ -206,11 +214,14 @@ static int dequeue_buffer(struct v4l2r_context *ctx, enum v4l2_buf_type type)
 			  __builtin_popcountll(ctx->queued_capture));
 		if (buffer.index < ctx->nb_captures &&
 		    ctx->captures[buffer.index].surface) {
-			ctx->captures[buffer.index].surface->status =
-				VASurfaceReady;
+			struct v4l2r_surface *frame = ctx->captures[buffer.index].surface;
+
+			frame->status = VASurfaceReady;
+			if (buffer.flags & V4L2_BUF_FLAG_ERROR)
+				frame->failed = true;
 			/* Start the format conversion right away so it
 			 * overlaps subsequent decodes. */
-			if (ctx->conv)
+			else if (ctx->conv)
 				v4l2r_convert_kick(ctx, buffer.index);
 		}
 	}
@@ -239,8 +250,12 @@ static int wait_on_capture_locked(struct v4l2r_context *ctx, uint32_t index)
 		int ret = poll(&pollfd, 1, V4L2R_POLL_TIMEOUT_MS);
 		/* POLLERR: the queue holds nothing to wait for (or is in
 		 * error), DQBUF would keep returning EAGAIN. */
-		if (ret <= 0 || (pollfd.revents & POLLERR))
+		if (ret <= 0 || (pollfd.revents & POLLERR)) {
+			v4l2r_log("CAPTURE wait failed: poll=%d events=%#x errno=%d queued=%#llx\n",
+				  ret, pollfd.revents, ret < 0 ? errno : 0,
+				  (unsigned long long)ctx->queued_capture);
 			return -EIO;
+		}
 
 		ret = dequeue_buffer(ctx, ctx->capture_format.type);
 		if (ret < 0 && ret != -EAGAIN)
@@ -252,6 +267,7 @@ static int wait_on_capture_locked(struct v4l2r_context *ctx, uint32_t index)
 
 VAStatus v4l2r_sync_capture(struct v4l2r_context *ctx, int capture_index)
 {
+	bool failed;
 	int ret;
 
 	if (capture_index < 0 || !ctx->streaming)
@@ -259,8 +275,13 @@ VAStatus v4l2r_sync_capture(struct v4l2r_context *ctx, int capture_index)
 
 	pthread_mutex_lock(&ctx->mutex);
 	ret = wait_on_capture_locked(ctx, capture_index);
+	failed = !ret && capture_index < (int)ctx->nb_captures &&
+		 ctx->captures[capture_index].surface &&
+		 ctx->captures[capture_index].surface->failed;
 	pthread_mutex_unlock(&ctx->mutex);
 
+	if (failed)
+		return VA_STATUS_ERROR_DECODING_ERROR;
 	if (ret < 0) {
 		v4l2r_log("failed waiting on CAPTURE buffer %d\n", capture_index);
 		return VA_STATUS_ERROR_OPERATION_FAILED;
@@ -294,8 +315,12 @@ static int wait_completed_locked(struct v4l2r_context *ctx, uint64_t target)
 		int ret = poll(&pollfd, 1, V4L2R_POLL_TIMEOUT_MS);
 		/* POLLERR: the queue holds nothing to wait for (or is in
 		 * error), DQBUF would keep returning EAGAIN. */
-		if (ret <= 0 || (pollfd.revents & POLLERR))
+		if (ret <= 0 || (pollfd.revents & POLLERR)) {
+			v4l2r_log("CAPTURE wait failed: poll=%d events=%#x errno=%d queued=%#llx\n",
+				  ret, pollfd.revents, ret < 0 ? errno : 0,
+				  (unsigned long long)ctx->queued_capture);
 			return -EIO;
+		}
 
 		ret = dequeue_buffer(ctx, ctx->capture_format.type);
 		if (ret < 0 && ret != -EAGAIN)
@@ -536,6 +561,7 @@ static VAStatus queue_decode(struct v4l2r_context *ctx,
 
 	ctx->queued_request |= 1u << output->index;
 	target->status = VASurfaceRendering;
+	target->failed = false;
 
 	pthread_mutex_unlock(&ctx->mutex);
 	return VA_STATUS_SUCCESS;

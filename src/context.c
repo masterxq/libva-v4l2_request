@@ -588,6 +588,7 @@ VAStatus v4l2r_context_bind_surface(struct v4l2r_context *ctx,
 
 	if (surface->ctx && surface->ctx != ctx)
 		return VA_STATUS_ERROR_SURFACE_BUSY;
+	surface->failed = false;
 
 	if (starting) {
 		ret = select_capture_format(ctx);
@@ -884,6 +885,16 @@ VAStatus v4l2r_DestroyContext(VADriverContextP va_ctx, VAContextID context_id)
 	if (!ctx)
 		return VA_STATUS_ERROR_INVALID_CONTEXT;
 
+	/* Surfaces may outlive their decoder context (for example at stream EOF). */
+	pthread_rwlock_wrlock(&drv->surface_lock);
+	if (ctx->video_fd >= 0 && ctx->streaming) {
+		for (unsigned int i = 0; i < ctx->nb_captures; i++) {
+			struct v4l2r_surface *frame = ctx->captures[i].surface;
+
+			if (frame && v4l2r_surface_ready_unlocked(frame) != VA_STATUS_SUCCESS)
+				frame->failed = true;
+		}
+	}
 	if (ctx->video_fd >= 0 && ctx->streaming) {
 		type = ctx->output_format.type;
 		ioctl(ctx->video_fd, VIDIOC_STREAMOFF, &type);
@@ -897,8 +908,33 @@ VAStatus v4l2r_DestroyContext(VADriverContextP va_ctx, VAContextID context_id)
 	for (unsigned int i = 0; i < V4L2R_OUTPUT_BUFFERS; i++)
 		output_buffer_cleanup(ctx, &ctx->output[i]);
 
-	for (unsigned int i = 0; i < ctx->nb_captures; i++)
-		capture_buffer_cleanup(ctx, &ctx->captures[i]);
+	for (unsigned int i = 0; i < ctx->nb_captures; i++) {
+		struct v4l2r_capture_buffer *capture = &ctx->captures[i];
+		struct v4l2r_surface *frame = capture->surface;
+
+		if (frame && !frame->backing && !frame->failed) {
+			struct v4l2r_surface_backing *backing = calloc(1, sizeof(*backing));
+
+			if (!backing || v4l2r_export_capture_dmabufs(ctx, capture, i) < 0) {
+				free(backing);
+				frame->failed = true;
+			} else {
+				backing->owner = drv;
+				backing->pixelformat = v4l2r_format_pixelformat(&ctx->capture_format);
+				backing->width = v4l2r_format_width(&ctx->capture_format);
+				backing->height = v4l2r_format_height(&ctx->capture_format);
+				backing->pitch = v4l2r_format_bytesperline(&ctx->capture_format);
+				backing->nb_planes = capture->nb_planes;
+				for (unsigned int p = 0; p < VIDEO_MAX_PLANES; p++) {
+					backing->dmabuf_fd[p] = capture->dmabuf_fd[p];
+					backing->plane_size[p] = capture->plane_size[p];
+					capture->dmabuf_fd[p] = -1;
+				}
+				frame->backing = backing;
+			}
+		}
+		capture_buffer_cleanup(ctx, capture);
+	}
 
 	/* Detach surfaces that were attached but never bound. */
 	pthread_mutex_lock(&drv->mutex);
@@ -923,6 +959,7 @@ VAStatus v4l2r_DestroyContext(VADriverContextP va_ctx, VAContextID context_id)
 	pthread_mutex_lock(&drv->mutex);
 	v4l2r_handles_free(&drv->contexts, context_id);
 	pthread_mutex_unlock(&drv->mutex);
+	pthread_rwlock_unlock(&drv->surface_lock);
 
 	return VA_STATUS_SUCCESS;
 }

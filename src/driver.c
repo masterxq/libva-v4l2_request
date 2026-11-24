@@ -928,6 +928,7 @@ VAStatus v4l2r_Terminate(VADriverContextP va_ctx)
 	v4l2r_handles_destroy(&drv->buffers);
 	v4l2r_handles_destroy(&drv->images);
 
+	pthread_rwlock_destroy(&drv->surface_lock);
 	pthread_mutex_destroy(&drv->mutex);
 
 	free(drv);
@@ -1035,7 +1036,9 @@ VAStatus V4L2R_DRIVER_INIT(VADriverContextP va_ctx)
 		return VA_STATUS_ERROR_ALLOCATION_FAILED;
 	}
 
+	atomic_init(&drv->backing_bytes, 0);
 	pthread_mutex_init(&drv->mutex, NULL);
+	pthread_rwlock_init(&drv->surface_lock, NULL);
 	va_ctx->pDriverData = drv;
 
 	enumerate_decoders(drv);
