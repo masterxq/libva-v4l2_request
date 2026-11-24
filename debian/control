@@ -1,0 +1,28 @@
+Source: libva-v4l2-request
+Section: video
+Maintainer: masterxq <masterxq@users.noreply.github.com>
+Build-Depends: debhelper-compat (= 13),
+               meson,
+               pkgconf,
+               libva-dev,
+               libdrm-dev,
+               linux-libc-dev
+Standards-Version: 4.7.4
+Homepage: https://xff.cz/git/libva-v4l2_request
+
+Package: v4l2-request-va-driver
+Architecture: linux-any
+Multi-Arch: same
+Depends: ${shlibs:Depends},
+         ${misc:Depends}
+Enhances: libva2
+Description: VA-API driver for V4L2 stateless (Request API) video decoders
+ v4l2_request_drv_video.so lets VA-API clients such as ffmpeg, mpv, Qt
+ Multimedia and Chromium decode MPEG-2, H.264, HEVC, VP8, VP9 and AV1 on
+ the stateless video decoders of the Linux media subsystem (V4L2 Media
+ Request API), for example on Rockchip RK3399/RK3588, Allwinner and
+ MediaTek SoCs (mtk-vcodec-dec with MM21 block-tiled output).
+ .
+ libva picks a driver by the name of the DRM driver of the render node. The
+ package links panfrost_drv_video.so and panthor_drv_video.so to the driver,
+ so it is used without LIBVA_DRIVER_NAME on boards with a Mali GPU.

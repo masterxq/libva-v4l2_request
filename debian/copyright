@@ -1,0 +1,62 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: libva-v4l2_request
+Upstream-Contact: Ondrej Jirman <megi@xff.cz>
+Source: https://xff.cz/git/libva-v4l2_request
+Comment: Built from the lisbon branch of
+ https://github.com/masterxq/libva-v4l2_request, a fork of
+ https://xff.cz/git/libva-v4l2_request with support for MediaTek MM21
+ decoder output.
+
+Files: *
+Copyright: 2026 Ondrej Jirman <megi@xff.cz>
+License: GPL-3.0-or-later
+
+Files: README
+       meson.build
+       meson_options.txt
+       src/decode.c
+       src/driver.c
+       src/image.c
+       src/surface.c
+Copyright: 2026 Ondrej Jirman <megi@xff.cz>
+           2026 masterxq
+License: GPL-3.0-or-later
+
+Files: patches/0001-media-rockchip-rga-Add-support-for-downconverting-fr.patch
+Copyright: 2026 Ondrej Jirman <megi@xff.cz>
+           Rockchip Electronics Co., Ltd.
+License: GPL-2.0-only
+Comment: A patch for the Linux kernel's Rockchip RGA driver, not built and
+ not installed; the patched files are GPL-2.0-only.
+
+Files: debian/*
+       .github/*
+Copyright: 2026 masterxq
+License: GPL-3.0-or-later
+
+License: GPL-3.0-or-later
+ This program is free software: you can redistribute it and/or modify it
+ under the terms of the GNU General Public License as published by the Free
+ Software Foundation, either version 3 of the License, or (at your option)
+ any later version.
+ .
+ This program is distributed in the hope that it will be useful, but
+ WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
+ or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+ more details.
+ .
+ On Debian systems, the complete text of the GNU General Public License
+ version 3 can be found in "/usr/share/common-licenses/GPL-3".
+
+License: GPL-2.0-only
+ This program is free software; you can redistribute it and/or modify it
+ under the terms of the GNU General Public License version 2 as published by
+ the Free Software Foundation.
+ .
+ This program is distributed in the hope that it will be useful, but
+ WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
+ or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+ more details.
+ .
+ On Debian systems, the complete text of the GNU General Public License
+ version 2 can be found in "/usr/share/common-licenses/GPL-2".
