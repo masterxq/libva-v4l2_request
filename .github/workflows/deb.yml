@@ -1,0 +1,46 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# The Debian package for arm64, built by debian/build.sh on every push to
+# the lisbon branch and on request (Actions, "Run workflow"). A build of the
+# lisbon branch is published to the APT registry codeberg.org/moblix (suite
+# testing) by the reusable workflow of masterxq/pocket-debs, which also
+# removes the previous version there; builds of other branches only leave
+# the artifact. Needs the secret CODEBERG_TOKEN.
+name: deb
+
+on:
+  push:
+    branches: [lisbon]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deb-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deb:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - id: build
+        run: |
+          debian/build.sh "$RUNNER_TEMP/deb"
+          cat "$RUNNER_TEMP/deb/VERSION" >> "$GITHUB_OUTPUT"
+          { echo '```'; cat "$RUNNER_TEMP/deb/SHA256SUMS"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: libva-v4l2-request_${{ steps.build.outputs.version }}_arm64
+          path: ${{ runner.temp }}/deb/
+          if-no-files-found: error
+
+  registry:
+    needs: deb
+    if: ${{ github.ref == 'refs/heads/lisbon' }}
+    uses: masterxq/pocket-debs/.github/workflows/registry.yml@main
+    with:
+      artefakte: 'libva-v4l2-request_*'
+    secrets:
+      CODEBERG_TOKEN: ${{ secrets.CODEBERG_TOKEN }}
