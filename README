@@ -462,3 +462,35 @@ License
 GPL-3.0-or-later, see COPYING.
 
 Copyright (C) 2026 Ondrej Jirman <megi@xff.cz>
+
+MediaTek linear output
+----------------------
+
+The firmware-free MT6785 memory converter (kernel option
+VIDEO_MEDIATEK_MDP_LINEAR, module mtk-mdp-linear) provides linear NV12 from
+MM21 and lossless P010 from MT2110R/T. The bridge imports decoder planes as
+DMA-BUFs; decoder references stay in their native layout. No conversion
+service, vendor library or application patch is required for this path.
+
+The converter needs MTK_CMDQ, MTK_MMSYS, VIDEO_DEV and the multimedia IOMMU.
+Device discovery uses capabilities rather than fixed /dev/video numbers.
+Without a suitable converter, MM21 retains the existing tiled export and
+CPU readback paths; tiled ten-bit profiles are not advertised without a
+lossless P010 path. Unsupported codecs remain software-decoder work.
+The memory converter does not advertise scaling, rotation or VA video
+processing. Those operations remain with a suitable renderer or another
+converter.
+
+Four conversion queue slots are reused. Presentation backing is allocated
+on demand and kept stable for each surface. Driver-owned standalone backing
+is limited to 512 MiB per VA display; exhausted allocation reports an error.
+The kernel converter separately limits queues to eight buffers and 256 MiB
+of live mapped/allocated queue storage. Neither limit includes decoder
+reference storage or DMA-BUF references retained solely by a client after
+export. STREAMOFF and context destruction drain hardware access before
+buffers can be reused. CPU image access brackets DMA-BUF synchronization.
+
+P010 preserves precision; it is not HDR tone mapping. Players must preserve
+transfer, primaries and mastering metadata and tone-map for SDR output when
+needed. The bridge performs no implicit ten-to-eight-bit truncation on the
+MT2110 path. Native HDR scanout depends on the display stack.
