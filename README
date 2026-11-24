@@ -1,3 +1,44 @@
+libva-v4l2_request, lisbon fork
+===============================
+
+This is a fork of megi's libva-v4l2_request
+(https://xff.cz/git/libva-v4l2_request) for the MediaTek mtk-vcodec-dec
+stateless decoder, the mainline Linux decoder that runs without firmware on
+the MT6785. That decoder writes frames only in MediaTek's MM21 block-tiled
+layout. The branch lisbon adds two driver commits to megi's master:
+
+- "Support MediaTek MM21 block-tiled decoder output": MM21 is exported as
+  DRM NV12 with the modifier DRM_FORMAT_MOD_MTK_16L_32S_TILE (composed, or
+  as separate R8 + GR88 layers); QBUF/DQBUF pass both memory planes of
+  MM21; vaGetImage detiles MM21 to NV12 on the CPU for clients that copy
+  frames (mpv --hwdec=vaapi-copy); surfaces created before the first decode
+  fall back to MM21 when the decoder cannot write NV12; waiting for a frame
+  stops on POLLERR instead of spinning.
+- "Advertise 10-bit profiles only with a usable 10-bit CAPTURE format":
+  mtk-vcodec-dec decodes 10 bit into MT2110T/R, which nothing imports yet,
+  so HEVC Main10 and VP9 profile 2 are no longer offered there and clients
+  decode such streams in software instead of failing on every frame.
+
+A third commit adds the meson option -Dmm21=enabled, which stops the build
+at configure time when the kernel uapi or libdrm headers lack MM21.
+Showing the frames directly on a Mali Bifrost GPU needs a Panfrost with
+working support for the MTK tile modifier; without it only copying
+clients work.
+
+The Debian package v4l2-request-va-driver installs the driver into the
+libva driver directory, together with the links panfrost_drv_video.so and
+panthor_drv_video.so, so libva loads it on Mali GPUs without
+LIBVA_DRIVER_NAME. debian/build.sh builds the package of the committed HEAD
+in a debian:forky container; GitHub Actions (.github/workflows/deb.yml)
+builds it for arm64 on every push to lisbon and publishes it to the APT
+registry of moblix on Codeberg (https://codeberg.org/moblix/-/packages,
+suite testing, component main); how to add that source to apt is described
+in https://github.com/masterxq/pocket-debs.
+
+This fork was developed with heavy AI assistance; review and release on the
+device are done by a human.
+
+
 libva-v4l2_request
 ==================
 
